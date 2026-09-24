@@ -1,0 +1,276 @@
+--- a/src/RizinScope.cpp
++++ b/src/RizinScope.cpp
+@@ -167,6 +167,50 @@
+ 			arch->addWarning("Function " + to_string(fcn_name) + " has no calling convention set, args may be inaccurate.");
+ 	}
+ 
++	// Debug prototypes describe entry arguments, not the stack spills at which
++	// DWARF locates them later. Let Sleigh assign the ABI storage from types.
++	PrototypePieces debugPrototype;
++	bool hasDebugPrototype = fcn->has_debuginfo && fcn->debug_callable && proto;
++	if (hasDebugPrototype)
++	{
++		const RzCallable *callable = fcn->debug_callable;
++		debugPrototype.model = proto;
++		debugPrototype.name = fcn_name;
++		debugPrototype.dotdotdot = callable->has_unspecified_parameters;
++		debugPrototype.outtype = callable->ret
++			? arch->getTypeFactory()->fromRzType(callable->ret)
++			: arch->types->getTypeVoid();
++		hasDebugPrototype = debugPrototype.outtype != nullptr;
++		rz_pvector_foreach_cpp<RzCallableArg>(callable->args, [&](RzCallableArg *arg) {
++			const RzType *type = arg->type;
++			const char *name = arg->name;
++			// Honor edits to an imported parameter, including a renamed one.
++			rz_pvector_foreach_cpp<RzAnalysisVar>(&fcn->vars, [&](RzAnalysisVar *var) {
++				if (var->origin.kind == RZ_ANALYSIS_VAR_ORIGIN_DWARF &&
++					var->origin.dw_var &&
++					var->origin.dw_var->kind == RZ_ANALYSIS_VAR_KIND_FORMAL_PARAMETER &&
++					RZ_STR_EQ(var->origin.dw_var->prefer_name, arg->name))
++				{
++					type = var->type;
++					name = var->name;
++					return false;
++				}
++				return true;
++			});
++			Datatype *parameterType = type ? arch->getTypeFactory()->fromRzType(type) : nullptr;
++			if (!parameterType)
++			{
++				hasDebugPrototype = false;
++				return false;
++			}
++			debugPrototype.intypes.push_back(parameterType);
++			debugPrototype.innames.emplace_back(name ? name : "");
++			return true;
++		});
++		if (!hasDebugPrototype)
++			arch->addWarning("Cannot represent the complete DWARF prototype of " + to_string(fcn_name));
++	}
++
+ 	RangeList varRanges; // to check for overlaps
+ 	auto stackSpace = arch->getStackSpace();
+ 
+@@ -202,6 +246,9 @@
+ 	ParamActive params(false);
+ 
+ 	rz_pvector_foreach_cpp<RzAnalysisVar>(&fcn->vars, [&](RzAnalysisVar *var) {
++		if (hasDebugPrototype && (rz_analysis_var_is_arg(var) ||
++			var->storage.type == RZ_ANALYSIS_VAR_STORAGE_REG))
++			return true;
+ 		std::string typeError;
+ 		Datatype *type = var->type ? arch->getTypeFactory()->fromRzType(var->type, &typeError) : nullptr;
+ 		if(!type)
+@@ -251,6 +298,9 @@
+ 	std::vector<Element *> argsByIndex;
+ 
+ 	rz_pvector_foreach_cpp<RzAnalysisVar>(&fcn->vars, [&](RzAnalysisVar *var) {
++		if (hasDebugPrototype && (rz_analysis_var_is_arg(var) ||
++			var->storage.type == RZ_ANALYSIS_VAR_STORAGE_REG))
++			return true;
+ 		auto type_it = var_types.find(var);
+ 		if(type_it == var_types.end())
+ 			return true;
+@@ -420,7 +470,20 @@
+ 
+ 	XmlDecode dec(arch, &doc);
+ 	auto sym = cache->addMapSym(dec);
+-	return dynamic_cast<FunctionSymbol *>(sym);
++	auto functionSymbol = dynamic_cast<FunctionSymbol *>(sym);
++	if (functionSymbol && hasDebugPrototype)
++	{
++		try
++		{
++			functionSymbol->getFunction()->getFuncProto().setPieces(debugPrototype);
++		}
++		catch (LowlevelError &error)
++		{
++			arch->addWarning("Cannot assign the DWARF prototype of " +
++				to_string(fcn_name) + ": " + error.explain);
++		}
++	}
++	return functionSymbol;
+ }
+ 
+ FunctionSymbol *RizinScope::registerRelocTarget(RzBinReloc *reloc) const
+--- a/src/RizinTypeFactory.cpp
++++ b/src/RizinTypeFactory.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <rz_core.h>
+ #include <rz_type.h>
++#include <limits>
+ 
+ #include "RizinUtils.h"
+ 
+@@ -51,29 +52,62 @@
+ 				return;
+ 			}
+ 
+-			// TODO: fix this super obsolete array stuff in struct sdb
+-			// if(elements > 0)
+-			// 	memberType = getTypeArray(elements, memberType);
+-
+-			TypeField tf = {
+-				(int4)offset, // id = offset by default
+-				(int4)offset, // Currently, this is 0 most of the time: member->offset,
+-				std::string(member->name),
+-				member_type
+-			};
+-			fields.push_back(tf);
+-
+-			// TODO: right now, we track member offset ourselves
+-			// which means all structs are assumed to be packed.
+-			// This should be changed if there is a clear notion of the offset in rizin at some point.
+-			offset += rz_type_db_get_bitsize(core->analysis->typedb, member->type) / 8;
++			// DWARF records explicit member offsets and total size. The C
++			// parser still leaves both unset, so retain its sequential layout.
++			const ut64 field_offset = type->size ? member->offset : offset;
++			if (field_offset > static_cast<ut64>(std::numeric_limits<int4>::max()) ||
++				member_type->getSize() > std::numeric_limits<int4>::max() - field_offset)
++				throw LowlevelError("Structure member offset is not representable");
++			fields.emplace_back(static_cast<int4>(fields.size()),
++				static_cast<int4>(field_offset), member->name, member_type);
++			offset = field_offset + member_type->getSize();
+ 		});
+-		setFields(fields, r, 0, 0);
++		if (type->size / 8 > static_cast<ut64>(std::numeric_limits<int4>::max()))
++			throw LowlevelError("Structure size is not representable");
++		setFields(fields, r, static_cast<int4>(type->size / 8), 0);
+ 		return r;
+ 	}
+ 	catch(std::invalid_argument &e)
+ 	{
+ 		arch->addWarning(std::string("Failed to load struct ") + type->name);
++		return nullptr;
++	}
++	catch(LowlevelError &e)
++	{
++		arch->addWarning(std::string("Failed to load struct ") + type->name + ": " + e.explain);
++		return nullptr;
++	}
++}
++
++Datatype *RizinTypeFactory::addRizinUnion(RzBaseType *type, StackTypes &stack_types, bool prototype)
++{
++	assert(type->kind == RZ_BASE_TYPE_KIND_UNION);
++	TypeUnion *result = getTypeUnion(type->name);
++	if (prototype)
++	{
++		prototypes.insert(result);
++		return result;
++	}
++	prototypes.erase(result);
++	try
++	{
++		std::vector<TypeField> fields;
++		rz_vector_foreach_cpp<RzTypeUnionMember>(&type->union_data.members, [&](RzTypeUnionMember *member) {
++			if (!member->type || !member->name)
++				return;
++			Datatype *memberType = fromRzType(member->type, nullptr, &stack_types);
++			if (!memberType)
++				throw LowlevelError("Union member type is not representable");
++			fields.emplace_back(static_cast<int4>(fields.size()), 0, member->name, memberType);
++		});
++		if (type->size / 8 > static_cast<ut64>(std::numeric_limits<int4>::max()))
++			throw LowlevelError("Union size is not representable");
++		setFields(fields, result, static_cast<int4>(type->size / 8), 0);
++		return result;
++	}
++	catch (LowlevelError &error)
++	{
++		arch->addWarning(std::string("Failed to load union ") + type->name + ": " + error.explain);
+ 		return nullptr;
+ 	}
+ }
+@@ -95,7 +129,25 @@
+ 		return nullptr;
+ 	try
+ 	{
+-		auto enumType = getTypeEnum(type->name);
++		Datatype *underlying = type->type ? fromRzType(type->type) : nullptr;
++		const ut64 width = type->size / 8;
++		TypeEnum *enumType = nullptr;
++		if (width > 0 && width <= sizeof(uintb))
++		{
++			const bool signedType = underlying && underlying->getMetatype() == TYPE_INT;
++			Document document;
++			document.setName("type");
++			document.addAttribute("name", type->name);
++			document.addAttribute("size", std::to_string(width));
++			document.addAttribute("metatype", signedType ? "int" : "uint");
++			document.addAttribute("enum", "true");
++			XmlDecode decoder(arch, &document);
++			enumType = dynamic_cast<TypeEnum *>(decodeType(decoder));
++		}
++		else
++			enumType = getTypeEnum(type->name);
++		if (!enumType)
++			throw LowlevelError("Enumeration type is not representable");
+ 		setEnumValues(namelist, vallist, assignlist, enumType);
+ 		return enumType;
+ 	}
+@@ -132,7 +184,7 @@
+ 		case RZ_TYPE_TYPECLASS_FLOATING:
+ 			return TYPE_FLOAT;
+ 		case RZ_TYPE_TYPECLASS_NONE:
+-			return TYPE_VOID;
++			return TYPE_UNKNOWN;
+ 		default:
+ 			return TYPE_UNKNOWN;
+ 	}
+@@ -171,6 +223,9 @@
+ 		case RZ_BASE_TYPE_KIND_STRUCT:
+ 			r = addRizinStruct(type, stack_types, prototype);
+ 			break;
++		case RZ_BASE_TYPE_KIND_UNION:
++			r = addRizinUnion(type, stack_types, prototype);
++			break;
+ 		case RZ_BASE_TYPE_KIND_ENUM:
+ 			r = addRizinEnum(type);
+ 			break;
+@@ -211,12 +266,6 @@
+ 	{
+ 		case RZ_TYPE_KIND_IDENTIFIER:
+ 		{
+-			if(ctype->identifier.kind == RZ_TYPE_IDENTIFIER_KIND_UNION)
+-			{
+-				if(error)
+-					*error = "Union types not supported in Decompiler";
+-				return nullptr;
+-			}
+ 
+ 			Datatype *r = stack_types ? findByName(ctype->identifier.name, *stack_types, prototype && refd) : findByName(ctype->identifier.name);
+ 			if(!r)
+@@ -229,6 +278,12 @@
+ 			{
+ 				if(error)
+ 					*error = "Type identifier " + std::string(ctype->identifier.name) + " is not the name of a struct";
++				return nullptr;
++			}
++			if(ctype->identifier.kind == RZ_TYPE_IDENTIFIER_KIND_UNION && r->getMetatype() != TYPE_UNION)
++			{
++				if(error)
++					*error = "Type identifier " + std::string(ctype->identifier.name) + " is not the name of a union";
+ 				return nullptr;
+ 			}
+ 			if(ctype->identifier.kind == RZ_TYPE_IDENTIFIER_KIND_ENUM && !r->isEnumType())
+@@ -295,7 +350,7 @@
+ 			{
+ 				return nullptr;
+ 			}
+-			return this->getTypeCode(pm, outtype, intypes, false); // dotdotdot arg can be used when rizin supports vararg callables
++			return this->getTypeCode(pm, outtype, intypes, callable->has_unspecified_parameters);
+ 		}
+ 	}
+ 	return nullptr;
+--- a/src/RizinTypeFactory.h
++++ b/src/RizinTypeFactory.h
+@@ -22,6 +22,7 @@
+ 		std::set<ghidra::Datatype *> prototypes; // set of types that have not been created fully yet
+ 
+ 		ghidra::Datatype *addRizinStruct(RzBaseType *type, StackTypes &stack_types, bool prototype);
++		ghidra::Datatype *addRizinUnion(RzBaseType *type, StackTypes &stack_types, bool prototype);
+ 		ghidra::Datatype *addRizinEnum(RzBaseType *type);
+ 		ghidra::Datatype *addRizinTypedef(RzBaseType *type, StackTypes &stack_types);
+ 		ghidra::Datatype *addRizinAtomicType(RzBaseType *type, StackTypes &stack_types);

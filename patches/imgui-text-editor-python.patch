@@ -1,0 +1,156 @@
+--- a/TextEditor.h
++++ b/TextEditor.h
+@@ -163,6 +163,9 @@
+ 		bool mAutoIndentation;
+ 
+ 		TokenizeCallback mTokenize;
++		void (*mColorize)(Lines&) = nullptr;
++		std::string (*mIndentation)(const Lines&, int, int, int) = nullptr;
++		bool mInsertSpaces = false;
+ 
+ 		TokenRegexStrings mTokenRegexStrings;
+ 
+--- a/TextEditor.cpp
++++ b/TextEditor.cpp
+@@ -7,6 +7,7 @@
+ #include "TextEditor.h"
+ 
+ #include "imgui.h"
++#include "imgui_internal.h"
+ 
+ // TODO
+ // - multiline comments vs single-line: latter is blocking start of a ML
+@@ -708,7 +709,7 @@
+ 		//ImGui::CaptureKeyboardFromApp(true);
+ 
+ 		io.WantCaptureKeyboard = true;
+-		io.WantTextInput = true;
++		io.WantTextInput = !IsReadOnly();
+ 
+ 		if (!IsReadOnly() && ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_Z))
+ 			Undo();
+@@ -889,6 +890,17 @@
+ 	snprintf(buf, 16, " %d ", globalLineMax);
+ 	mTextStart = ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX, -1.0f, buf, nullptr, nullptr).x + mLeftMargin;
+ 
++	if (mHandleKeyboardInputs && ImGui::IsWindowFocused() && !IsReadOnly())
++	{
++		const auto cursor = GetActualCursorCoordinates();
++		auto& ime = ImGui::GetCurrentContext()->PlatformImeData;
++		ime.WantVisible = ime.WantTextInput = true;
++		ime.InputPos = ImVec2(cursorScreenPos.x + mTextStart + TextDistanceToLineStart(cursor),
++			cursorScreenPos.y + cursor.mLine * mCharAdvance.y);
++		ime.InputLineHeight = mCharAdvance.y;
++		ime.ViewportId = ImGui::GetWindowViewport()->ID;
++	}
++
+ 	if (!mLines.empty())
+ 	{
+ 		float spaceSize = ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX, -1.0f, " ", nullptr, nullptr).x;
+@@ -1270,7 +1282,10 @@
+ 				}
+ 				else
+ 				{
+-					line.insert(line.begin(), Glyph('\t', TextEditor::PaletteIndex::Background));
++					if (mLanguageDefinition.mInsertSpaces)
++						line.insert(line.begin(), mTabSize, Glyph(' ', PaletteIndex::Default));
++					else
++						line.insert(line.begin(), Glyph('\t', TextEditor::PaletteIndex::Background));
+ 					modified = true;
+ 				}
+ 			}
+@@ -1294,13 +1309,14 @@
+ 
+ 				u.mAddedStart = start;
+ 				u.mAddedEnd = rangeEnd;
+-				u.mAfter = mState;
+ 
+ 				mState.mSelectionStart = start;
+ 				mState.mSelectionEnd = end;
++				u.mAfter = mState;
+ 				AddUndo(u);
+ 
+ 				mTextChanged = true;
++				Colorize(start.mLine, end.mLine - start.mLine + 1);
+ 
+ 				EnsureCursorVisible();
+ 			}
+@@ -1323,20 +1339,28 @@
+ 
+ 	if (aChar == '\n')
+ 	{
++		const auto cindex = GetCharacterIndex(coord);
++		std::string indentation;
++		if (mLanguageDefinition.mIndentation != nullptr)
++			indentation = mLanguageDefinition.mIndentation(mLines, coord.mLine, cindex, mTabSize);
++		else if (mLanguageDefinition.mAutoIndentation)
++		{
++			const auto& line = mLines[coord.mLine];
++			for (size_t it = 0; it < line.size() && isascii(line[it].mChar) && isblank(line[it].mChar); ++it)
++				indentation += line[it].mChar;
++		}
++
+ 		InsertLine(coord.mLine + 1);
+ 		auto& line = mLines[coord.mLine];
+ 		auto& newLine = mLines[coord.mLine + 1];
+-
+-		if (mLanguageDefinition.mAutoIndentation)
+-			for (size_t it = 0; it < line.size() && isascii(line[it].mChar) && isblank(line[it].mChar); ++it)
+-				newLine.push_back(line[it]);
+-
+-		const size_t whitespaceSize = newLine.size();
+-		auto cindex = GetCharacterIndex(coord);
++		newLine.reserve(indentation.size() + line.size() - cindex);
++		for (const auto character : indentation)
++			newLine.emplace_back(character, PaletteIndex::Default);
+ 		newLine.insert(newLine.end(), line.begin() + cindex, line.end());
+-		line.erase(line.begin() + cindex, line.begin() + line.size());
+-		SetCursorPosition(Coordinates(coord.mLine + 1, GetCharacterColumn(coord.mLine + 1, (int)whitespaceSize)));
+-		u.mAdded = (char)aChar;
++		line.erase(line.begin() + cindex, line.end());
++		SetCursorPosition(Coordinates(coord.mLine + 1, GetCharacterColumn(coord.mLine + 1, (int)indentation.size())));
++		u.mAdded = "\n";
++		u.mAdded += indentation;
+ 	}
+ 	else
+ 	{
+@@ -1362,9 +1386,19 @@
+ 				}
+ 			}
+ 
+-			for (auto p = buf; *p != '\0'; p++, ++cindex)
+-				line.insert(line.begin() + cindex, Glyph(*p, PaletteIndex::Default));
+-			u.mAdded = buf;
++			if (aChar == '\t' && mLanguageDefinition.mInsertSpaces)
++			{
++				const auto spaces = mTabSize - GetCharacterColumn(coord.mLine, cindex) % mTabSize;
++				line.insert(line.begin() + cindex, spaces, Glyph(' ', PaletteIndex::Default));
++				cindex += spaces;
++				u.mAdded.assign(spaces, ' ');
++			}
++			else
++			{
++				for (auto p = buf; *p != '\0'; p++, ++cindex)
++					line.insert(line.begin() + cindex, Glyph(*p, PaletteIndex::Default));
++				u.mAdded = buf;
++			}
+ 
+ 			SetCursorPosition(Coordinates(coord.mLine, GetCharacterColumn(coord.mLine, cindex)));
+ 		}
+@@ -2249,6 +2283,16 @@
+ {
+ 	if (mLines.empty() || !mColorizerEnabled)
+ 		return;
++
++	if (mLanguageDefinition.mColorize != nullptr)
++	{
++		if (mCheckComments || mColorRangeMin < mColorRangeMax)
++			mLanguageDefinition.mColorize(mLines);
++		mCheckComments = false;
++		mColorRangeMin = std::numeric_limits<int>::max();
++		mColorRangeMax = 0;
++		return;
++	}
+ 
+ 	if (mCheckComments)
+ 	{
