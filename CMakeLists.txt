@@ -875,6 +875,21 @@ if(BUILD_TESTING)
     PASS_REGULAR_EXPRESSION "symbolic-solver-ok"
   )
   add_test(
+    NAME symbolic_script_trace
+    COMMAND "${Python_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/symbolic_solver.py"
+      --mydbg $<TARGET_FILE:mydbg>
+      --script "${CMAKE_CURRENT_SOURCE_DIR}/examples/solve_trace.py"
+      --target "$<TARGET_FILE:debuggee_crackme_x86_64>"
+      --timeout-seconds 240
+      --expect "trace-solve-ok"
+  )
+  set_tests_properties(symbolic_script_trace PROPERTIES
+    TIMEOUT 420
+    SKIP_RETURN_CODE 77
+    PASS_REGULAR_EXPRESSION "symbolic-solver-ok"
+  )
+  add_test(
     NAME symbolic_script_keygen
     COMMAND "${Python_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/symbolic_solver.py"

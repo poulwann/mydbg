@@ -6,3 +6,7 @@
 # cp312-abi3 wheels, so any CPython >= 3.12 works, including 3.13/3.14.
 angr==9.2.223
 angrop==9.2.12.post3
+# Optional concrete-execution fast path (angr.options.unicorn). angr does not
+# declare this dependency, and without it the unicorn engine silently
+# disables itself at import time.
+unicorn==2.1.4

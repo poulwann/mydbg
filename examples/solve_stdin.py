@@ -44,9 +44,10 @@ def run(dbg):
     avoid = [symbolic.resolve_project_symbol(project, "stdin_fail")]
     print(f"[+] stdin_success at {find:#x}, avoiding {avoid[0]:#x}")
 
+    unicorn = os.environ.get("MYDBG_STDIN_UNICORN") == "1"
     solution = symbolic.solve_entry_stdin(dbg, find, avoid=avoid, size=24,
                                           printable=True, timeout=300,
-                                          binary=executable)
+                                          binary=executable, unicorn=unicorn)
     print(solution.summary())
     if solution.status != "found":
         raise RuntimeError(f"stdin solve failed: {solution.status}")

@@ -58,11 +58,26 @@ def requires_angr() -> bool:
 # --- Snapshot -> SimState conversion ----------------------------------------
 
 
+def _parse_register_value(text: str) -> int | None:
+    """Parse one LLDB register value string; non-numeric registers return None."""
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        if stripped.lower().startswith("0x"):
+            return int(stripped, 16)
+        return int(stripped, 10)
+    except ValueError:
+        return None
+
+
 def _register_candidates(name: str) -> list[str]:
     """Candidate angr/archinfo register names for one LLDB register name."""
     lowered = name.lower().removeprefix("$")
     aliases = {
         "eip": "rip", "esp": "rsp", "ebp": "rbp",
+        "eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
+        "esi": "rsi", "edi": "rdi",
     }
     primary = aliases.get(lowered, lowered)
     candidates = [primary]
@@ -135,7 +150,12 @@ def state_from_debugger(
         (m for m in snapshot.modules if m.base <= snapshot.pc < m.end),
         snapshot.modules[0],
     )
-    project = angr.Project(main_module.path, auto_load_libs=False)
+    # Load the image at the live runtime base: Tracer (and any project-image
+    # lifting) then works directly on runtime addresses, and the SimProcedure
+    # hooks land on the live PLT stubs without a delta.
+    project = angr.Project(main_module.path,
+                           main_opts={"base_addr": main_module.base},
+                           auto_load_libs=False)
     # angr maps the image at its own base and installs SimProcedure hooks for
     # PLT stubs there. The explored state runs at the live runtime base, so
     # every hook is re-registered at the runtime PLT address; otherwise calls
@@ -197,20 +217,20 @@ def state_from_debugger(
     seeded_ranges: list[tuple[int, int]] = []
     # Seed widest-first and skip aliases (r8d/bp/ebx...) that are subranges of
     # already-stored registers; otherwise narrow alias values clobber the wide
-    # register seeded earlier from the same live values.
+    # register seeded earlier from the same live values. Values come from the
+    # snapshot itself, not from live register reads: the session may have run
+    # on since the snapshot, and the state must match the snapshot's moment.
     storable: list[tuple[int, int, str, int]] = []
     for register in snapshot.registers:
+        value = _parse_register_value(register.value)
+        if value is None:
+            skipped_registers.append(register.name)
+            continue
         for alias in _register_candidates(register.name):
             entry = state.arch.registers.get(alias)
             if entry is None:
                 continue
-            offset, width = entry[0], entry[1]
-            try:
-                value = dbg.read_register(register.name.lower().removeprefix("$"))
-            except Exception:  # noqa: BLE001 - non-numeric registers are expected
-                skipped_registers.append(register.name)
-                break
-            storable.append((width, offset, alias, value))
+            storable.append((entry[1], entry[0], alias, value))
             break
         else:
             skipped_registers.append(register.name)
@@ -272,12 +292,17 @@ def symbolize_memory(state, address: int, size: int, name: str = "input"):
 
 
 def symbolize_register(state, register: str, name: str | None = None):
-    """Make one register symbolic; returns the claripy variable."""
+    """Make one register symbolic; returns the claripy variable.
+
+    The register is used exactly as spelled first (so ``edi`` symbolizes the
+    32-bit subregister), falling back to the archinfo alias map.
+    """
     angr, claripy = _import_angr()
-    for alias in _register_candidates(register):
-        if alias in state.arch.registers:
-            break
-    else:
+    lowered = register.lower().removeprefix("$")
+    candidates = [lowered, *_register_candidates(register)]
+    alias = next((candidate for candidate in candidates
+                  if candidate in state.arch.registers), None)
+    if alias is None:
         raise ValueError(f"unknown register {register!r} for {state.arch.name}")
     width = state.arch.registers[alias][1]
     variable = claripy.BVS(name or alias, width * 8)
@@ -446,6 +471,15 @@ class Solution:
                 lines.append(f"error sample: {self.result.error_sample}")
         return "\n".join(lines)
 
+    def model_int(self, name: str) -> int:
+        """Numeric model for one symbol (register values, endianness-free)."""
+        if not self.states:
+            raise KeyError(f"no solution state for {name!r}")
+        for symbol in self.symbols:
+            if symbol.name == name:
+                return self.states[0].solver.eval(symbol.variable)
+        raise KeyError(name)
+
     def apply(self, dbg, *, timeout: float = 10.0) -> None:
         """Write every solved model back into the live session."""
         if self.status != "found":
@@ -457,7 +491,10 @@ class Solution:
             if symbol.kind == "memory":
                 dbg.write_memory(symbol.address, model, timeout=timeout)
             else:
-                value = int.from_bytes(model, "little")
+                # Register models evaluate straight from the solver: byte
+                # order in eval(cast_to=bytes) follows bit order, not target
+                # endianness.
+                value = self.states[0].solver.eval(symbol.variable)
                 dbg.write_register(symbol.register, value, timeout=timeout)
 
 
@@ -467,8 +504,10 @@ def _parse_symbol_spec(spec, state) -> Symbol:
     if lowered.startswith("reg:"):
         register = lowered[4:]
         variable = symbolize_register(state, register)
-        alias = next(alias for alias in _register_candidates(register)
-                     if alias in state.arch.registers)
+        lowered_name = register.lower().removeprefix("$")
+        alias = next((candidate for candidate in
+                      (lowered_name, *_register_candidates(register))
+                      if candidate in state.arch.registers), lowered_name)
         width = state.arch.registers[alias][1]
         return Symbol("register", alias, variable, register=register, size=width)
     parts = lowered.split(":")
@@ -678,6 +717,7 @@ def solve_entry_stdin(
     printable: bool = True,
     prefix: bytes = b"",
     binary: str | None = None,
+    unicorn: bool = False,
     timeout: float = 120.0,
     max_steps: int = 20000,
     max_states: int = 4000,
@@ -690,13 +730,19 @@ def solve_entry_stdin(
     the stdin bytes are constrained to printable ASCII up front, which prunes
     the space before exploration starts. The solved input comes back as
     ``InputSolution.input_bytes``; verify it against the live process with a
-    relaunch (see ``mydbg.rop``).
+    relaunch (see ``mydbg.rop``). ``unicorn`` enables angr's concrete
+    fast-path engine (requires the ``unicorn`` package from
+    ``requirements-symbolic.txt``).
     """
     angr, claripy = _import_angr()
     project = _entry_project(dbg, binary=binary)
     variable = claripy.BVS("stdin", size * 8)
+    state_options = set()
+    if unicorn:
+        state_options |= set(angr.options.unicorn)
     state = project.factory.entry_state(
-        stdin=angr.SimPackets("stdin", content=[variable]))
+        stdin=angr.SimPackets("stdin", content=[variable]),
+        add_options=state_options)
     if printable:
         constrain_printable(state, variable)
     constrain_exact(state, variable, prefix)
@@ -787,6 +833,127 @@ def call_way(
     if simgr.found:
         solution.input_bytes = simgr.found[0].solver.eval(variable, cast_to=bytes)
         solution.input_bytes = solution.input_bytes.rstrip(b"\x00")
+    return solution
+
+
+# --- Trace-guided solving ------------------------------------------------------
+
+
+def record_trace(dbg, *, max_steps: int = 4000,
+                 stop_at: int | None = None) -> list[int]:
+    """Single-step the live session from the current stop, recording PCs.
+
+    The trace starts at the current PC and ends when the target exits, stops
+    for another reason, reaches ``stop_at``, or exhausts ``max_steps``. LLDB
+    engine round-trips make this seconds-scale; use it on the interesting span,
+    not on whole programs.
+    """
+    snapshot = dbg.snapshot()
+    if snapshot.state != "stopped":
+        raise RuntimeError(f"trace recording needs a stopped session, got {snapshot.state}")
+    trace = [snapshot.pc]
+    for _ in range(max_steps):
+        stepped = dbg.step_instruction(step_over=False)
+        if stepped.state != "stopped":
+            break
+        trace.append(stepped.pc)
+        if stop_at is not None and stepped.pc == stop_at:
+            break
+    return trace
+
+
+def reduce_trace_blocks(project, trace: list[int]) -> list[int]:
+    """Reduce an instruction trace to basic-block heads for angr's Tracer.
+
+    Block sizes come from lifting the on-disk image, which matches the live
+    bytes unless instruction patches changed the executed code; patched code
+    regions should not be traced.
+    """
+    blocks: list[int] = []
+    index = 0
+    total = len(trace)
+    while index < total:
+        head = trace[index]
+        blocks.append(head)
+        try:
+            size = project.factory.block(head).size
+        except Exception:  # noqa: BLE001 - unmapped or undecodable: treat as 1
+            size = 1
+        end = head + max(size, 1)
+        while index < total and head <= trace[index] < end:
+            index += 1
+    return blocks
+
+
+# --- Trace-guided solving ------------------------------------------------------
+
+
+def trace_way(
+    dbg,
+    target: int | None = None,
+    *,
+    symbolize: Sequence[str] = (),
+    avoid: Sequence = (),
+    find=None,
+    stop_at: int | None = None,
+    max_trace_steps: int = 4000,
+    timeout: float = 120.0,
+    max_steps: int = 20000,
+    max_states: int = 4000,
+    technique: str = "bfs",
+) -> Solution:
+    """Guided symbolic tracing: replay the live trace block-by-block, then
+    explore from the traced state.
+
+    Stop the session at the trace's starting point; the recording walks the
+    live run until it exits, reaches ``stop_at`` (e.g. the address of the
+    function you stopped at for the interesting part), or stalls. The traced
+    state lands on the last basic block of the trace carrying the concrete
+    path history; ``symbolize`` specs (same format as ``find_way``) apply to
+    the *traced* state, so the input can be re-solved from a point the
+    concrete run already reached. Pass ``find`` (address or predicate) or
+    ``target`` for the exploration.
+    """
+    start = dbg.snapshot()
+    trace = record_trace(dbg, max_steps=max_trace_steps, stop_at=stop_at)
+    project, state, notes = state_from_debugger(dbg, snapshot=start)
+    blocks = reduce_trace_blocks(project, trace)
+    if len(blocks) < 2:
+        raise RuntimeError(f"trace is too short to replay: {len(trace)} instructions")
+
+    simgr = project.factory.simgr(state)
+    # Explicit replay loop instead of an exploration technique: angr's
+    # technique hooks re-enter on nested simgr.step calls, which double-counts
+    # bookkeeping. The state is fully concrete here, so each step must land on
+    # exactly the next recorded block; strays are kept under ``desync`` for
+    # diagnosis instead of silently dropped.
+    for expected in blocks[1:]:
+        simgr.step()
+        successors = simgr.active
+        keep = [successor for successor in successors if successor.addr == expected]
+        stray = [successor for successor in successors if successor.addr != expected]
+        simgr.stashes["active"] = keep
+        if stray:
+            simgr.stashes.setdefault("desync", []).extend(stray)
+        if not keep:
+            raise RuntimeError(
+                f"state diverged from the trace: expected {expected:#x}, "
+                f"got {[hex(s.addr) for s in stray] or 'nothing'}")
+    traced_state = simgr.active[0]
+
+    symbols = [_parse_symbol_spec(spec, traced_state) for spec in symbolize]
+    exploration_target = find if find is not None else target
+    if exploration_target is None:
+        raise RuntimeError("trace_way needs find or target")
+    simgr2, result = explore(project, traced_state, exploration_target,
+                             avoid=avoid, timeout=timeout, max_steps=max_steps,
+                             max_states=max_states, technique=technique)
+    solution = Solution(status=result.status, symbols=symbols,
+                        states=list(simgr2.found), result=result, notes=notes,
+                        manager=simgr2)
+    if simgr2.found:
+        solution.models = {symbol.name: model_bytes(simgr2.found[0], symbol.variable)
+                           for symbol in symbols}
     return solution
 
 
