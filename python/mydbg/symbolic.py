@@ -486,7 +486,23 @@ def find_way(
 
 
 def resolve_symbol(dbg, name: str) -> int:
-    """Resolve a symbol or expression to a runtime address via the engine."""
+    """Resolve a symbol to a runtime address.
+
+    Prefers breakpoint placement (works on remote/QEMU sessions and freestanding
+    fixtures where expression evaluation is unavailable), then falls back to
+    expression evaluation.
+    """
+    try:
+        breakpoint_id = dbg.set_breakpoint(name)
+    except Exception:  # noqa: BLE001 - fall through to expression evaluation
+        breakpoint_id = None
+    if breakpoint_id is not None:
+        for breakpoint in dbg.list_breakpoints():
+            if breakpoint.id == breakpoint_id and breakpoint.addresses:
+                dbg.remove_breakpoint(breakpoint_id)
+                return breakpoint.addresses[0]
+        if breakpoint_id is not None:
+            dbg.remove_breakpoint(breakpoint_id)
     for expression in (f"&{name}", name):
         try:
             result = dbg.evaluate(expression)

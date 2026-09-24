@@ -814,4 +814,50 @@ if(BUILD_TESTING)
     PASS_REGULAR_EXPRESSION
       "flag\\{scripted_debuggers_turn_runtime_state_into_answers\\}"
   )
+  add_test(
+    NAME symbolic_script_x86_64
+    COMMAND "${Python_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/symbolic_solver.py"
+      --mydbg $<TARGET_FILE:mydbg>
+      --script "${CMAKE_CURRENT_SOURCE_DIR}/examples/solve_symbolic.py"
+      --target "$<TARGET_FILE:debuggee_crackme_x86_64>"
+      --timeout-seconds 240
+      --expect "crackme solved symbolically"
+  )
+  set_tests_properties(symbolic_script_x86_64 PROPERTIES
+    TIMEOUT 420
+    SKIP_RETURN_CODE 77
+    PASS_REGULAR_EXPRESSION "symbolic-solver-ok"
+  )
+  foreach(architecture IN ITEMS mips32 ppc32)
+    string(TOUPPER "${architecture}" architecture_upper)
+    if(architecture STREQUAL "mips32")
+      set(qemu "${QEMU_MIPSEL_EXECUTABLE}")
+      set(qemu_machine "mipsel")
+      set(pointer_slot "")
+    else()
+      set(qemu "${QEMU_PPC_EXECUTABLE}")
+      set(qemu_machine "ppc")
+      # LLDB's function breakpoint lands after crackme_entry's prologue, which
+      # has already moved the input pointer to the saved frame slot.
+      set(pointer_slot "r31:24")
+    endif()
+    add_test(
+      NAME symbolic_script_${architecture}
+      COMMAND "${Python_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/symbolic_solver.py"
+        --mydbg $<TARGET_FILE:mydbg>
+        --script "${CMAKE_CURRENT_SOURCE_DIR}/tests/scripts/symbolic_solve.py"
+        --target "${MYDBG_${architecture_upper}_FIXTURE}"
+        --qemu "${qemu}"
+        --ptr-regs "a0,r4,r3"
+        --ptr-slot "${pointer_slot}"
+    )
+    set_tests_properties(symbolic_script_${architecture} PROPERTIES
+      TIMEOUT 600
+      SKIP_RETURN_CODE 77
+      PASS_REGULAR_EXPRESSION "symbolic-solver-ok"
+      RESOURCE_LOCK qemu_${architecture}
+    )
+  endforeach()
 endif()
