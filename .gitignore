@@ -1,0 +1,45 @@
+# Bootstrapped dependencies and out-of-source builds
+/.deps/
+/build/
+/CMakeUserPresets.json
+
+# Accidental in-source CMake and Ninja output
+/CMakeFiles/
+/CMakeCache.txt
+/CTestTestfile.cmake
+/cmake_install.cmake
+/compile_commands.json
+/Makefile
+/build.ninja
+/.ninja_deps
+/.ninja_log
+/_deps/
+/generated/
+
+# Local debugger and GUI state
+/imgui.ini
+/mydbg.ini
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+/.pytest_cache/
+/.venv/
+/venv/
+
+# Editor, language-server, and operating-system state
+/.cache/
+/.clangd/
+/.idea/
+/.vscode/
+*~
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Crash and profiling output
+/core
+/core.*
+*.profraw
+*.profdata
