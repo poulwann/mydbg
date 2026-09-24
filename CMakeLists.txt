@@ -158,6 +158,7 @@ set(MYDBG_MANUAL_FILES
   08-python-automation.md
   09-settings.md
   10-plugins.md
+  11-symbolic-execution.md
 )
 set(MYDBG_MANUAL_CHAPTERS "")
 foreach(CHAPTER_FILE IN LISTS MYDBG_MANUAL_FILES)

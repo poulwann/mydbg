@@ -20,6 +20,7 @@ The project is aimed at native debugging, reverse engineering, CTF challenges, a
 - Binary string extraction and typed first/next value scans
 - ELF security, process, glibc heap, pointer-chain, telescope, search, and cyclic-pattern tools
 - Embedded Python automation and a source-level script debugger with Python-aware indentation and themed syntax highlighting
+- Optional angr-backed symbolic execution from any stopped PC (snapshot-to-SimState, bounded exploration, model apply-back) and angrop gadget/chain tooling with a relaunch-and-verify ROP loop
 - Versioned native plugin API for commands, panels, menu items, and lifecycle callbacks
 - Built-in searchable manual, configurable keybindings, themes, scaling, fonts, and persistent layouts
 - Checked INI localization catalogs for first-party GUI text, console output, and diagnostics
@@ -306,6 +307,7 @@ The GUI and debugger communicate through copied snapshots. LLDB objects remain o
 - [Python automation and script debugging](docs/manual/08-python-automation.md)
 - [Settings, layout, localization, and help](docs/manual/09-settings.md)
 - [Native plugins](docs/manual/10-plugins.md)
+- [Symbolic execution and ROP](docs/manual/11-symbolic-execution.md)
 
 Press F1 in the GUI to read the manual. Chapter text is embedded; keep the
 generated `manual/` directory beside
