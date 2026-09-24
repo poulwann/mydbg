@@ -16,6 +16,7 @@ Requires the optional angr backend (see ``requirements-symbolic.txt`` and
 from __future__ import annotations
 
 import hashlib
+import re
 import struct
 import time
 from dataclasses import dataclass, field
@@ -486,23 +487,14 @@ def find_way(
 
 
 def resolve_symbol(dbg, name: str) -> int:
-    """Resolve a symbol to a runtime address.
+    """Resolve a symbol to its runtime entry address.
 
-    Prefers breakpoint placement (works on remote/QEMU sessions and freestanding
-    fixtures where expression evaluation is unavailable), then falls back to
-    expression evaluation.
+    Order matters: expression evaluation and ``image lookup`` report the true
+    function entry, while breakpoint placement reports the post-prologue
+    address LLDB sets. The breakpoint route is the last resort for QEMU/remote
+    sessions where the other two are unavailable — good enough as an
+    exploration target, wrong as a call target.
     """
-    try:
-        breakpoint_id = dbg.set_breakpoint(name)
-    except Exception:  # noqa: BLE001 - fall through to expression evaluation
-        breakpoint_id = None
-    if breakpoint_id is not None:
-        for breakpoint in dbg.list_breakpoints():
-            if breakpoint.id == breakpoint_id and breakpoint.addresses:
-                dbg.remove_breakpoint(breakpoint_id)
-                return breakpoint.addresses[0]
-        if breakpoint_id is not None:
-            dbg.remove_breakpoint(breakpoint_id)
     for expression in (f"&{name}", name):
         try:
             result = dbg.evaluate(expression)
@@ -510,6 +502,24 @@ def resolve_symbol(dbg, name: str) -> int:
             continue
         if result.numeric_value is not None:
             return result.numeric_value
+    try:
+        lookup = dbg.execute(f"image lookup -n {name}")
+    except Exception:  # noqa: BLE001 - fall through to breakpoint placement
+        lookup = None
+    if lookup is not None and lookup.success:
+        match = re.search(r"Address: \S+\[(0x[0-9a-fA-F]+)\]", lookup.message)
+        if match:
+            return int(match.group(1), 16)
+    try:
+        breakpoint_id = dbg.set_breakpoint(name)
+    except Exception:  # noqa: BLE001 - nothing else to try
+        breakpoint_id = None
+    if breakpoint_id is not None:
+        for breakpoint in dbg.list_breakpoints():
+            if breakpoint.id == breakpoint_id and breakpoint.addresses:
+                dbg.remove_breakpoint(breakpoint_id)
+                return breakpoint.addresses[0]
+        dbg.remove_breakpoint(breakpoint_id)
     raise RuntimeError(f"cannot resolve {name!r} to an address")
 
 

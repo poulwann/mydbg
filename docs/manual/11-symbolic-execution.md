@@ -1,0 +1,143 @@
+# Symbolic Execution and ROP
+
+mydbg integrates symbolic execution (angr) and ROP chain tooling (angrop) as
+optional, script-first backends. The GUI and console bootstrap scripts; the
+reverser owns and iterates on them. Every helper here runs inside mydbg's
+embedded Python, on live debugger state.
+
+## Installing the backend
+
+The backend needs the interpreter LLDB itself uses:
+
+```console
+./scripts/bootstrap-symbolic.sh
+export MYDBG_SYMBOLIC_PYTHONPATH=$PWD/.venv-symbolic/lib/python3.14/site-packages
+```
+
+The script queries `lldb --print-script-interpreter-info`, creates
+`.venv-symbolic` with that interpreter, and installs the pinned ecosystem
+(`requirements-symbolic.txt`: angr 9.2.223, angrop 9.2.12.post3). Without it,
+`mydbg.symbolic.requires_angr()` returns False and the symbolic features
+report a diagnostic instead of failing mysteriously.
+
+## Symbolic execution from a stopped PC
+
+The core workflow — stop anywhere, snapshot the live state into an angr
+`SimState`, mark inputs symbolic, explore to a target, apply the solved model
+back to the live session:
+
+```python
+from mydbg import symbolic
+
+def run(dbg):
+    dbg.launch(["./crackme", "wrong"], stop_at="main")
+    dbg.set_breakpoint("crackme_entry")
+    dbg.continue_execution()
+    dbg.wait_for_stop(timeout=5)
+
+    seed_slot = dbg.read_register("rbp") - 0x44  # read the disassembly first
+    solution = symbolic.find_way(
+        dbg,
+        symbolic.resolve_symbol(dbg, "crackme_success"),
+        symbolize=[f"{seed_slot:x}:4"],
+        timeout=120,
+    )
+    print(solution.summary())
+    if solution.status == "found":
+        solution.apply(dbg)      # writes the model into the live session
+    dbg.continue_execution()
+```
+
+- `symbolize` entries: `reg:rdi` (a symbolic register), `deadbeef:20`
+  (symbolic bytes at a hex address), or `deadbeef` (8 bytes).
+- `find_way` seeds the state from the live process: the main module image
+  (applied instruction patches included), a stack window around SP, and all
+  live registers. Exploration is bounded by `timeout`, `max_steps`, and
+  `max_states`; everything past a bound lands in the manager's `cut` stash
+  instead of running away.
+- The state executes **live bytes at runtime addresses**: PIE bases come from
+  the session, and PLT stubs are re-hooked at the runtime base so angr's
+  SimProcedures (printf and friends) fire instead of jumping through the live
+  GOT into the dynamic loader.
+- Registers are seeded widest-first, so LLDB's alias register list (`r8d`,
+  `bp`, ...) never clobbers the wide registers.
+- `solution.summary()` prints the model, and `solution.states`/`manager`
+  expose the raw angr objects for custom work.
+
+LLDB function breakpoints land **after the prologue**; if the function has
+already spilled its argument, symbolize the stack slot (as above), not the
+argument register.
+
+See `examples/solve_symbolic.py` for the complete x86_64 crackme solve, and
+`tests/scripts/symbolic_solve.py` for the cross-architecture variant (QEMU
+user sessions, big- and little-endian).
+
+## KLEE artifact interop
+
+KLEE solves at build time (LLVM bitcode, `klee` runtime); mydbg replays the
+results on the live process:
+
+```python
+from mydbg import symbolic
+
+objects = symbolic.import_ktest("test000001.ktest")
+for name, data in objects.items():
+    dbg.write_memory(target_address, data)
+```
+
+## ROP with angrop
+
+`mydbg.rop` wraps angrop's ROP analysis for the ret2win/exploit iteration
+loop:
+
+```python
+from mydbg import rop
+
+dbg.launch([target, payload_path], stop_at="main")
+win = rop.resolve_symbol(dbg, "rop_win")      # true entry address
+
+engine = rop.RopEngine(target)
+engine.find_gadgets()                          # cached by binary digest
+print(engine.summary())
+gadget = engine.find_gadgets_matching("pop rdi ; ret", exact=True)[0]
+
+payload = b"A" * 56 + rop.p64(gadget.addr) + rop.p64(token) + rop.p64(win)
+config = rop.RunConfig(argv=[target, payload_path], stop_at="main")
+landing = rop.test_landing(dbg, config, payload, 0,
+                           send_stdin=False, expect_output=b"rop_win_ok",
+                           expect_exit=0)
+print(landing.summary())                       # rop-landing-landed/MISSED pc=...
+```
+
+- Gadget scans are single-threaded and cached under `~/.cache/mydbg/rop/`
+  keyed by binary content, bad bytes, and angrop version; relaunch loops never
+  rescan. Set `MYDBG_ROP_CACHE_DIR` to relocate the cache.
+- `RunConfig` + `relaunch` restarts the target with identical arguments so
+  each iteration lands at the same stack depth; `test_landing` reports the
+  actual PC on a miss (a misaligned chain faults at its shifted address,
+  which tells you the offset is wrong).
+- angrop's internal alarm-based timeouts are disabled because they cannot run
+  on mydbg's script thread; enforce your own bounds.
+- Default bad bytes are `\x0a\x0d`. NUL is deliberately absent — non-PIE
+  gadget addresses contain it, and file/pipe inputs carry it fine.
+- Deliver byte-exact payloads through a **file named in argv**. mydbg launches
+  with a pty whose canonical line discipline corrupts binary stdin (EOF,
+  erase, and signal bytes are processed rather than delivered); `place()`
+  writing directly into live memory is the alternative for targets that are
+  already past their input read.
+
+See `examples/rop_crackme.py` for the full loop, including the deliberately
+misaligned chain being rejected with its fault PC.
+
+## Limits and good practice
+
+- The state snapshot covers the main module mapping, a ±64 KiB stack window,
+  and any `extra_regions` you pass. Anything outside is zero-filled
+  (`ZERO_FILL_UNCONSTRAINED_*`), so reads of unrelated pages do not poison
+  the path.
+- One exploration at a time per session; long jobs block the script that
+  started them (the interpreter holds the GIL), and the GUI lease keeps the
+  console actions honest. Cancel via the script debugger's stop button.
+- The segment bases (`fs`/`gs`) are zero in the symbolic state, which keeps
+  stack-canary checks self-consistent; canary-failing paths are simply paths
+  the solver prunes.
