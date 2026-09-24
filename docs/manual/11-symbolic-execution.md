@@ -85,6 +85,62 @@ for name, data in objects.items():
     dbg.write_memory(target_address, data)
 ```
 
+## Input-space solves: symbolic stdin and keygens
+
+Two patterns from angr's CTF-solving workflows where the answer is input
+bytes, not memory. The solved input verifies against the live target through
+a relaunch (`mydbg.rop.test_landing`), not a memory write.
+
+### Symbolic stdin flag finder
+
+Explore from the target's entry with symbolic stdin; constrain the bytes up
+front; find the success branch. `find`/`avoid` take addresses or state
+predicates:
+
+```python
+from mydbg import symbolic
+
+project = symbolic._entry_project(dbg, binary="./challenge")
+find = symbolic.resolve_project_symbol(project, "stdin_success")
+avoid = [symbolic.resolve_project_symbol(project, "stdin_fail")]
+
+solution = symbolic.solve_entry_stdin(
+    dbg, find, avoid=avoid, size=24, printable=True, timeout=300,
+    binary="./challenge",
+)
+print(solution.summary())          # input: mydbg_symb0lic_stdin_win
+```
+
+Name the success/failure paths as `noinline` functions in your target so the
+symbol table yields clean find/avoid addresses. See
+`examples/solve_stdin.py`, which relaunches the target with the solved 24
+bytes in an input file and requires `stdin_flag_ok`.
+
+### Keygen via call state
+
+Call a validation function with a symbolic NUL-terminated printable argument
+and accept any state where a nonzero return value is satisfiable:
+
+```python
+dbg.launch(["./keygenme", "wrong"], stop_at="main")
+function = symbolic.resolve_symbol(dbg, "keygen_valid")
+solution = symbolic.call_way(dbg, function, size=17, printable=True)
+print(solution.input_bytes)        # a 16-char serial
+```
+
+The argument lives in symbolized memory below SP, clear of the callee frame;
+the return sentinel is on the stack (amd64) or in the link register
+(arm/mips/ppc). 32-bit x86 (stack arguments) is unsupported. See
+`examples/solve_keygen.py`, which relaunches with the serial on argv and
+requires `keygen_ok`.
+
+### Exploration knobs
+
+`explore()` and both input-space solves take `technique="bfs"|"dfs"` (DFS
+keeps the frontier small on branchy targets) plus the same hard caps. For
+input-format constraints beyond `printable`/`prefix`, apply them directly:
+`state.solver.add(variable.get_bytes(0, 5) == b"flag{")`.
+
 ## ROP with angrop
 
 `mydbg.rop` wraps angrop's ROP analysis for the ret2win/exploit iteration
