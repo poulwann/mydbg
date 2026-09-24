@@ -44,3 +44,5 @@ Thumbs.db
 /core.*
 *.profraw
 *.profdata
+*.core
+examples/rop_emporium/rop_emporium/rop_emporium_all_challenges.zip

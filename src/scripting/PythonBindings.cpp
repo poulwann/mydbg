@@ -250,6 +250,19 @@ public:
     return wait_for_next_stop(current, timeout);
   }
 
+  // Captures up to 48 instructions at an arbitrary address into the session's
+  // instruction view; returns the snapshot carrying them. This is the
+  // script-side code-recon primitive (the console `u`/`disasm` alias is
+  // textual and capped at 32).
+  PythonSnapshot disassemble(std::uint64_t address, double timeout) {
+    const SessionSnapshot current = engine_.snapshot();
+    if (current.state != SessionState::Stopped) {
+      throw std::runtime_error("disassembly requires a stopped session");
+    }
+    await(engine_.read_instructions(address), timeout_from_seconds(timeout));
+    return PythonSnapshot{engine_.snapshot()};
+  }
+
   PythonSnapshot wait_for_stop(double timeout) {
     const SessionSnapshot current = engine_.snapshot();
     return PythonSnapshot{wait_until(
@@ -875,6 +888,8 @@ PYBIND11_EMBEDDED_MODULE(_mydbg, module) {
       .def("step_instruction", &PythonDebugger::step_instruction,
            py::arg("step_over") = false, py::arg("timeout") = 10.0)
       .def("run_to", &PythonDebugger::run_to, py::arg("address"),
+           py::arg("timeout") = 10.0)
+      .def("disassemble", &PythonDebugger::disassemble, py::arg("address"),
            py::arg("timeout") = 10.0)
       .def("wait_for_stop", &PythonDebugger::wait_for_stop,
            py::arg("timeout") = 10.0)
