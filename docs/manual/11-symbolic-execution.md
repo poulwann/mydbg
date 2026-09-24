@@ -192,6 +192,73 @@ solution.apply(dbg)          # the live session sits at the traced point
 
 See `examples/solve_trace.py`.
 
+## Engine-owned qemu-user sessions
+
+`connect_remote` can spawn and own the qemu-user stub itself — the debugger
+starts `qemu -g port [-L sysroot] target args`, holds the target's stdin, and
+tears the stub down with the session:
+
+```python
+process = dbg.connect_remote(
+    binary, "", mode="qemu-user", timeout=60,
+    qemu="qemu-arm", sysroot="/tmp/sysroots/armel",
+    cwd="/path/to/challenge", stdin_file="/tmp/payload.bin",
+)
+dbg.send_stdin(b"more input\r\n")   # reaches the target through the owned pipe
+```
+
+- `stdin_file` redirects the target's stdin to a file; `send_stdin` writes
+  through the owned pipe. Both deliver raw bytes — the pty corruption that
+  affects local launches does not apply.
+- Target output flows back through the session's output capture
+  (`process.recv`), drained continuously and once more at exit.
+- Symbol breakpoints work: when LLDB cannot resolve a main-image symbol
+  (qemu-user stops dynamic binaries at the dynamic loader, where LLDB also
+  cannot bind pending breakpoints), the engine resolves it from the image's
+  own ELF symbol table. Non-PIE values are runtime addresses; PIE images
+  resolve once mapped.
+- Local launches accept `stdin_path=` for the same raw-stdin delivery via
+  LLDB's `target.input-path`.
+- Session teardown kills the owned stub after the LLDB connection ends — do
+  not kill it from a script while the session is live (mydbg's exit hangs on
+  a dead stub).
+
+## ROP Emporium workflow (examples/rop_emporium/)
+
+The ROP Emporium challenge set ships under `examples/rop_emporium/`; the
+solve scripts drive it entirely through the debugger: gadget scan (angrop),
+chain assembly, engine-owned qemu sessions, breakpoint stops, and output
+verification — ret2win (x64/i386/ARM), split, callme (three csu-style calls),
+and write4 (library-base discovery through the guest's own `link_map`, since
+qemu's stub does not report guest libraries).
+
+Sysroots are environment provisioning: download the target glibc package for
+each architecture and unpack it into `/tmp/sysroots/<arch>` (override with
+`MYDBG_ROP_SYSROOTS`):
+
+```console
+# Debian pool: libc6_<version>_<arch>.deb -> unpack ./lib and ./usr/lib
+# x64 needs the loader + libc reachable under sysroot/lib64,
+# plus a guest /bin/sh (dash) for challenges that call system().
+qemu-arm -L /tmp/sysroots/armel ./ret2win_armv5   # smoke test
+```
+
+Findings worth knowing before you script your own:
+
+- Use `continue_and_wait` for breakpoint legs: `wait_for_stop` can return the
+  stop you were already sitting on.
+- qemu-mipsel + LLDB 21 misbehaves on dynamically linked guests (registers
+  read stale, entry trap repeats); the static-fixture tests pass, so prefer
+  static targets on MIPS until LLDB's mips gdb-remote register context
+  improves.
+- angrop's `func_call` bails on some gadget mixes ("overlapped moves"); when
+  it does, assemble the chain from its gadget database by hand
+  (`find_gadgets_matching`) — callme's solve does exactly that.
+- Modern glibc `system()` uses posix_spawn/clone; clone under qemu-user or
+  under a traced process crashes in this environment regardless of the
+  debugger. split's solve verifies the chain with `puts` and documents the
+  payload for `system`.
+
 ## ROP with angrop
 
 `mydbg.rop` wraps angrop's ROP analysis for the ret2win/exploit iteration
