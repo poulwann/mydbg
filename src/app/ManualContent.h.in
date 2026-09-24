@@ -1,0 +1,17 @@
+#pragma once
+
+#include <array>
+#include <string_view>
+
+namespace debugger::manual {
+
+struct ChapterAsset {
+  std::string_view file_name;
+  std::string_view markdown;
+};
+
+inline constexpr std::array<ChapterAsset, @MYDBG_MANUAL_CHAPTER_COUNT@>
+    chapters{{
+@MYDBG_MANUAL_CHAPTERS@}};
+
+} // namespace debugger::manual

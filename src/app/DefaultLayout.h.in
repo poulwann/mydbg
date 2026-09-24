@@ -1,0 +1,9 @@
+#pragma once
+
+#include <string_view>
+
+namespace mydbg::app {
+
+inline constexpr std::string_view default_layout{R"MYDBG_LAYOUT(@MYDBG_DEFAULT_LAYOUT@)MYDBG_LAYOUT"};
+
+} // namespace mydbg::app
