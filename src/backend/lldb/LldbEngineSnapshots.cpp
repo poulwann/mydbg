@@ -159,6 +159,35 @@ std::optional<lldb::addr_t> resolve_address(std::string_view expression,
   return std::nullopt;
 }
 
+void append_output_chunk(SessionSnapshot &state, std::string_view data,
+                         OutputStream stream) {
+  if (data.empty()) {
+    return;
+  }
+  constexpr std::size_t maximum_output_bytes = 1024U * 1024U;
+  if (state.process_output.size() + data.size() > maximum_output_bytes) {
+    const std::size_t discard =
+        state.process_output.size() + data.size() - maximum_output_bytes;
+    state.process_output.erase(0, discard);
+  }
+  state.process_output.append(data);
+
+  state.output_chunks.push_back(OutputChunk{
+      .sequence = ++state.output_sequence,
+      .stream = stream,
+      .data = std::string{data},
+  });
+  state.output_chunk_bytes += data.size();
+  while (state.output_chunk_bytes > maximum_output_bytes &&
+         !state.output_chunks.empty()) {
+    state.output_chunk_bytes -= state.output_chunks.front().data.size();
+    state.output_chunks.pop_front();
+  }
+  // Output-only updates still need to reach waiting consumers: the publish
+  // guard compares revisions, so appends must look like changes.
+  ++state.revision;
+}
+
 bool append_process_output(lldb::SBProcess &process, SessionSnapshot &state) {
   if (!process.IsValid()) {
     return false;
@@ -166,25 +195,7 @@ bool append_process_output(lldb::SBProcess &process, SessionSnapshot &state) {
 
   const auto append = [&state](OutputStream stream, const char *data,
                                std::size_t size) {
-    constexpr std::size_t maximum_output_bytes = 1024U * 1024U;
-    if (state.process_output.size() + size > maximum_output_bytes) {
-      const std::size_t discard =
-          state.process_output.size() + size - maximum_output_bytes;
-      state.process_output.erase(0, discard);
-    }
-    state.process_output.append(data, size);
-
-    state.output_chunks.push_back(OutputChunk{
-        .sequence = ++state.output_sequence,
-        .stream = stream,
-        .data = std::string{data, size},
-    });
-    state.output_chunk_bytes += size;
-    while (state.output_chunk_bytes > maximum_output_bytes &&
-           !state.output_chunks.empty()) {
-      state.output_chunk_bytes -= state.output_chunks.front().data.size();
-      state.output_chunks.pop_front();
-    }
+    append_output_chunk(state, std::string_view{data, size}, stream);
   };
 
   bool appended = false;

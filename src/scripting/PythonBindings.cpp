@@ -185,14 +185,19 @@ public:
   std::shared_ptr<PythonProcess>
   launch(const std::vector<std::string> &argv, const std::string &stop_at,
          const std::map<std::string, std::string> &environment,
-         const std::string &working_directory, double timeout);
+         const std::string &working_directory, double timeout,
+         const std::string &stdin_path);
 
   std::shared_ptr<PythonProcess> attach(std::uint64_t process_id,
                                         double timeout);
 
   std::shared_ptr<PythonProcess>
   connect_remote(const std::string &executable, const std::string &endpoint,
-                 const std::string &mode, double timeout);
+                 const std::string &mode, double timeout,
+                 const std::string &qemu, const std::string &sysroot,
+                 const std::vector<std::string> &arguments,
+                 const std::string &working_directory,
+                 const std::string &stdin_file);
 
   std::shared_ptr<PythonProcess> restart(double timeout);
 
@@ -596,7 +601,8 @@ std::shared_ptr<PythonProcess>
 PythonDebugger::launch(const std::vector<std::string> &argv,
                        const std::string &stop_at,
                        const std::map<std::string, std::string> &environment,
-                       const std::string &working_directory, double timeout) {
+                       const std::string &working_directory, double timeout,
+                       const std::string &stdin_path) {
   if (argv.empty() || argv.front().empty()) {
     throw std::invalid_argument(
         l10n::text(l10n::Key::PythonBindingLaunchArgvRequired));
@@ -618,6 +624,7 @@ PythonDebugger::launch(const std::vector<std::string> &argv,
       .arguments = {argv.begin() + 1, argv.end()},
       .working_directory = working_directory,
       .stop_policy = policy,
+      .stdin_path = stdin_path,
   };
   options.environment.reserve(environment.size());
   for (const auto &[name, value] : environment) {
@@ -662,8 +669,13 @@ std::shared_ptr<PythonProcess> PythonDebugger::attach(std::uint64_t process_id,
 std::shared_ptr<PythonProcess>
 PythonDebugger::connect_remote(const std::string &executable,
                                const std::string &endpoint,
-                               const std::string &mode, double timeout) {
-  if (endpoint.empty()) {
+                               const std::string &mode, double timeout,
+                               const std::string &qemu,
+                               const std::string &sysroot,
+                               const std::vector<std::string> &arguments,
+                               const std::string &working_directory,
+                               const std::string &stdin_file) {
+  if (endpoint.empty() && qemu.empty()) {
     throw std::invalid_argument(
         l10n::text(l10n::Key::PythonBindingEmptyRemoteEndpoint));
   }
@@ -687,6 +699,11 @@ PythonDebugger::connect_remote(const std::string &executable,
                 .executable = executable,
                 .endpoint = endpoint,
                 .mode = session_mode,
+                .qemu_executable = qemu,
+                .sysroot = sysroot,
+                .arguments = arguments,
+                .working_directory = working_directory,
+                .stdin_file = stdin_file,
             }),
             timeout_duration);
   const SessionSnapshot current = wait_until(
@@ -835,12 +852,16 @@ PYBIND11_EMBEDDED_MODULE(_mydbg, module) {
       .def("launch", &PythonDebugger::launch, py::arg("argv"),
            py::arg("stop_at") = "main",
            py::arg("environment") = std::map<std::string, std::string>{},
-           py::arg("cwd") = "", py::arg("timeout") = 10.0)
+           py::arg("cwd") = "", py::arg("timeout") = 10.0,
+           py::arg("stdin_path") = "")
       .def("attach", &PythonDebugger::attach, py::arg("process_id"),
            py::arg("timeout") = 10.0)
       .def("connect_remote", &PythonDebugger::connect_remote,
            py::arg("executable"), py::arg("endpoint"),
-           py::arg("mode") = "qemu-user", py::arg("timeout") = 10.0)
+           py::arg("mode") = "qemu-user", py::arg("timeout") = 10.0,
+           py::arg("qemu") = "", py::arg("sysroot") = "",
+           py::arg("arguments") = std::vector<std::string>{},
+           py::arg("cwd") = "", py::arg("stdin_file") = "")
       .def("restart", &PythonDebugger::restart, py::arg("timeout") = 10.0)
       .def("detach", &PythonDebugger::detach, py::arg("timeout") = 10.0)
       .def("terminate", &PythonDebugger::terminate, py::arg("timeout") = 10.0)

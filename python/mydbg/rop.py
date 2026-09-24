@@ -184,6 +184,11 @@ class RopEngine:
         self.ensure_gadgets()
         return self._rop.set_regs(**registers)
 
+    def func_call(self, function, arguments, **kwargs):
+        """Chain that sets the argument registers and calls ``function``."""
+        self.ensure_gadgets()
+        return self._rop.func_call(function, arguments, **kwargs)
+
     def do_syscall(self, syscall_number: int, arguments: dict, **kwargs):
         self.ensure_gadgets()
         return self._rop.do_syscall(syscall_number, arguments, **kwargs)
@@ -194,7 +199,7 @@ class RopEngine:
         return self._rop.execve(path=path, arguments=arguments, env=env, **kwargs)
 
     def chain_bytes(self, chain) -> bytes:
-        return bytes(chain.payload_bytes())
+        return bytes(chain.payload_str())
 
 
 # --- Placement and the relaunch loop -------------------------------------------

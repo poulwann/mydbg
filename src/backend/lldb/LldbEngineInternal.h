@@ -125,6 +125,16 @@ bool write_frameless_qemu_mips_register(
     std::string_view register_name, std::uint64_t value,
     std::string &failure);
 
+struct ElfSymbol {
+  std::string name;
+  std::uint64_t value{};
+};
+
+void append_output_chunk(SessionSnapshot &state, std::string_view data,
+                         OutputStream stream = OutputStream::Stdout);
+
+std::vector<ElfSymbol> read_elf_symbols(const std::filesystem::path &path);
+
 void collect_matching_sections(lldb::SBSection section, std::string_view wanted,
                                std::vector<lldb::SBSection> &matches);
 void append_console(SessionSnapshot &state, std::string_view command,

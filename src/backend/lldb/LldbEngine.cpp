@@ -2,12 +2,187 @@
 #include "backend/lldb/LldbSessions.h"
 #include "localization/Localization.h"
 
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <spawn.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern char **environ;
+
 namespace debugger {
 
 using namespace lldb_detail;
 using namespace std::chrono_literals;
 
 namespace {
+
+// Spawns an engine-owned qemu-user gdbstub: `qemu -g port [-L sysroot]
+// target args`. Returns the child pid and a pipe the engine owns for the
+// target's stdin (write end only; the read end is the child's fd 0, or the
+// child reads `stdin_file` directly). POSIX spawn keeps the fork out of the
+// worker thread's signal state.
+struct QemuStubChild {
+  pid_t pid{-1};
+  int stdin_fd{-1};
+  int stdout_fd{-1};
+};
+
+std::optional<QemuStubChild> spawn_qemu_stub(
+    const std::string &qemu_executable, const std::string &sysroot,
+    const std::string &target, const std::vector<std::string> &arguments,
+    const std::string &working_directory, const std::string &stdin_file,
+    std::uint16_t port, std::string &failure) {
+  int stdin_pipe[2] = {-1, -1};
+  int stdout_pipe[2] = {-1, -1};
+  int stdin_file_fd = -1;
+  if (stdin_file.empty() && pipe(stdin_pipe) != 0) {
+    failure = "stdin pipe failed";
+    return std::nullopt;
+  }
+  if (pipe(stdout_pipe) != 0) {
+    failure = "stdout pipe failed";
+    if (stdin_pipe[0] >= 0) {
+      close(stdin_pipe[0]);
+      close(stdin_pipe[1]);
+    }
+    return std::nullopt;
+  }
+
+  std::vector<std::string> storage;
+  // Reserve before taking .data() pointers: growth would dangle the argv
+  // entries (this once turned -L into garbage bytes).
+  storage.reserve(4 + arguments.size());
+  std::vector<char *> argv;
+  argv.push_back(const_cast<char *>(qemu_executable.c_str()));
+  if (!sysroot.empty()) {
+    storage.push_back("-L");
+    argv.push_back(storage.back().data());
+    storage.push_back(sysroot);
+    argv.push_back(storage.back().data());
+  }
+  storage.push_back("-g");
+  argv.push_back(storage.back().data());
+  storage.push_back(std::to_string(port));
+  argv.push_back(storage.back().data());
+  argv.push_back(const_cast<char *>(target.c_str()));
+  for (const std::string &argument : arguments) {
+    argv.push_back(const_cast<char *>(argument.c_str()));
+  }
+  argv.push_back(nullptr);
+
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  if (!stdin_file.empty()) {
+    stdin_file_fd = open(stdin_file.c_str(), O_RDONLY);
+    if (stdin_file_fd < 0) {
+      failure = "cannot open " + stdin_file;
+      close(stdin_pipe[0]);
+      close(stdin_pipe[1]);
+      close(stdout_pipe[0]);
+      close(stdout_pipe[1]);
+      return std::nullopt;
+    }
+    posix_spawn_file_actions_adddup2(&actions, stdin_file_fd, STDIN_FILENO);
+    posix_spawn_file_actions_addclose(&actions, stdin_file_fd);
+  } else {
+    posix_spawn_file_actions_adddup2(&actions, stdin_pipe[0], STDIN_FILENO);
+  }
+  posix_spawn_file_actions_adddup2(&actions, stdout_pipe[1], STDOUT_FILENO);
+  posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/tmp/mydbg-qemu.log",
+                                   O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (!working_directory.empty()) {
+    posix_spawn_file_actions_addchdir_np(&actions, working_directory.c_str());
+  }
+
+  pid_t pid = -1;
+  // Minimal environment: an inherited nix-shell LD_LIBRARY_PATH breaks
+  // qemu's interpreter mapping ("File exists").
+  std::string path_storage = "PATH=" + std::string(
+      getenv("PATH") ? getenv("PATH") : "/usr/bin:/bin");
+  std::string home_storage = "HOME=" + std::string(
+      getenv("HOME") ? getenv("HOME") : "/root");
+  std::string lang_storage = "LANG=C";
+  char *environment[] = {path_storage.data(), home_storage.data(),
+                         lang_storage.data(), nullptr};
+  const int spawn_error =
+      posix_spawnp(&pid, argv[0], &actions, nullptr, argv.data(),
+                   environment);
+  posix_spawn_file_actions_destroy(&actions);
+  close(stdout_pipe[1]);
+  if (stdin_pipe[0] >= 0) {
+    close(stdin_pipe[0]);
+  }
+  if (stdin_file_fd >= 0) {
+    close(stdin_file_fd);
+  }
+  if (spawn_error != 0 || pid <= 0) {
+    failure = "posix_spawnp failed: " + std::string(strerror(spawn_error));
+    close(stdout_pipe[0]);
+    if (stdin_pipe[1] >= 0) {
+      close(stdin_pipe[1]);
+    }
+    return std::nullopt;
+  }
+  // The target's stdout flows through the owned pipe: the run loop drains it
+  // into the session's output chunks.
+  fcntl(stdout_pipe[0], F_SETFL, fcntl(stdout_pipe[0], F_GETFL) | O_NONBLOCK);
+  return QemuStubChild{pid, stdin_file.empty() ? stdin_pipe[1] : -1,
+                       stdout_pipe[0]};
+}
+
+// A bindable loopback port for the gdbstub; the brief bind/close race is
+// acceptable because qemu exits with a diagnostic the connect flow reports.
+std::optional<std::uint16_t> pick_stub_port(std::string &failure) {
+  int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (socket_fd < 0) {
+    failure = "socket failed";
+    return std::nullopt;
+  }
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  for (int attempt = 0; attempt < 64; ++attempt) {
+    address.sin_port = htons(static_cast<std::uint16_t>(
+        26000 + ((rand() ^ static_cast<int>(getpid())) % 20000)));
+    if (bind(socket_fd, reinterpret_cast<sockaddr *>(&address),
+             sizeof(address)) == 0) {
+      const std::uint16_t port = ntohs(address.sin_port);
+      close(socket_fd);
+      return port;
+    }
+  }
+  close(socket_fd);
+  failure = "no free loopback port";
+  return std::nullopt;
+}
+
+// Waits until qemu's gdbstub port is claimed. /proc/net/tcp misses qemu's
+// listener entirely, so claim detection uses a bind probe (EADDRINUSE), the
+// same approach the test harness uses.
+bool wait_stub_listen(std::uint16_t port) {
+  for (int attempt = 0; attempt < 250; ++attempt) {
+    const int probe = socket(AF_INET, SOCK_STREAM, 0);
+    if (probe >= 0) {
+      sockaddr_in address{};
+      address.sin_family = AF_INET;
+      address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      address.sin_port = htons(port);
+      const int bind_result =
+          bind(probe, reinterpret_cast<sockaddr *>(&address), sizeof(address));
+      close(probe);
+      if (bind_result < 0 && errno == EADDRINUSE) {
+        return true;
+      }
+      if (bind_result == 0) {
+        // We briefly own the port; drop it and let qemu retry consumers.
+      }
+    }
+    usleep(20 * 1000);
+  }
+  return false;
+}
 
 struct LldbRuntime {
   LldbRuntime()
@@ -753,7 +928,47 @@ void LldbEngine::run() {
     reset_value_scan_state();
     reset_binary_string_state();
   };
+  auto stop_qemu_child = [&] {
+    // Drain any buffered target output first: killing qemu would lose it.
+    if (qemu_stdout_fd_ >= 0) {
+      char buffer[8192];
+      for (;;) {
+        const ssize_t count = read(qemu_stdout_fd_, buffer, sizeof(buffer));
+        if (count <= 0) {
+          break;
+        }
+        lldb_detail::append_output_chunk(
+            state, std::string_view{buffer, static_cast<std::size_t>(count)});
+      }
+      close(qemu_stdout_fd_);
+      qemu_stdout_fd_ = -1;
+    }
+    if (qemu_pid_ > 0) {
+      kill(qemu_pid_, SIGKILL);
+      waitpid(qemu_pid_, nullptr, WNOHANG);
+      qemu_pid_ = -1;
+    }
+    if (qemu_stdin_fd_ >= 0) {
+      close(qemu_stdin_fd_);
+      qemu_stdin_fd_ = -1;
+    }
+  };
+  auto drain_qemu_stdout = [&] {
+    if (qemu_stdout_fd_ < 0) {
+      return;
+    }
+    char buffer[8192];
+    for (;;) {
+      const ssize_t count = read(qemu_stdout_fd_, buffer, sizeof(buffer));
+      if (count <= 0) {
+        return;
+      }
+      lldb_detail::append_output_chunk(
+          state, std::string_view{buffer, static_cast<std::size_t>(count)});
+    }
+  };
   auto replace_target = [&] {
+    stop_qemu_child();
     reset_target_session();
     if (process.IsValid() && should_destroy(process.GetState())) {
       process.Destroy();
@@ -1169,6 +1384,34 @@ void LldbEngine::run() {
     } else {
       const std::string symbol{specification};
       breakpoint = target.BreakpointCreateByName(symbol.c_str());
+      // Remote/qemu sessions can stop at the dynamic loader where LLDB cannot
+      // resolve main-image symbols (and LLDB 21 never binds pending
+      // breakpoints over gdb-remote). Fall back to the engine's own ELF
+      // symbol table; non-PIE values are runtime addresses.
+      if (breakpoint.IsValid() && breakpoint.GetNumLocations() == 0 &&
+          (state.mode == SessionMode::Remote ||
+           state.mode == SessionMode::QemuUser ||
+           state.mode == SessionMode::QemuSystem)) {
+        if (main_symbols_path_ != state.local_symbol_path ||
+            main_symbols_.empty()) {
+          main_symbols_.clear();
+          for (const ElfSymbol &elf_symbol :
+               read_elf_symbols(state.local_symbol_path)) {
+            main_symbols_.emplace_back(elf_symbol.name, elf_symbol.value);
+          }
+          main_symbols_path_ = state.local_symbol_path;
+        }
+        const auto found = std::ranges::find_if(
+            main_symbols_, [symbol](const auto &candidate) {
+              return candidate.first == symbol;
+            });
+        if (found != main_symbols_.end() && found->second != 0) {
+          target.BreakpointDelete(breakpoint.GetID());
+          script_conditions.erase(breakpoint.GetID());
+          breakpoint = target.BreakpointCreateByAddress(
+              static_cast<lldb::addr_t>(found->second));
+        }
+      }
     }
     if (!breakpoint.IsValid()) {
       state.error = l10n::text(l10n::Key::EngineLLDBRejectedTheBreakpoint);
@@ -1630,7 +1873,12 @@ void LldbEngine::run() {
           std::array<char, 4096> path{};
           target.GetExecutable().GetPath(path.data(), path.size());
           const std::string selected_path = safe_string(path.data());
-          if (!selected_path.empty()) {
+          if (!selected_path.empty() &&
+              (state.mode == SessionMode::Local ||
+               state.target_path.empty())) {
+            // Local sessions always follow the launched binary; remote
+            // sessions (gdbserver, qemu-user) report the stub's own
+            // executable (qemu), which is not the image under analysis.
             state.target_path = selected_path;
             if (local_target_hint ||
                 (!state.process_is_remote &&
@@ -4108,6 +4356,14 @@ void LldbEngine::run() {
         publish();
         lldb::SBLaunchInfo launch_info(static_cast<const char **>(nullptr));
         launch_info.SetListener(listener);
+        // target.input-path redirects the inferior's stdin; the setting is
+        // cleared for launches that do not ask for it so later launches read
+        // from the usual channel.
+        debugger.HandleCommand(
+            (std::string{"settings set target.input-path "} +
+             (options.stdin_path.empty() ? std::string{"\"\""}
+                                          : options.stdin_path))
+                .c_str());
         std::vector<const char *> argument_pointers;
         argument_pointers.reserve(options.arguments.size() + 1);
         for (const std::string &argument : options.arguments) {
@@ -4192,7 +4448,7 @@ void LldbEngine::run() {
       }
       case CommandKind::ConnectRemote: {
         RemoteOptions options = std::move(command.remote_options);
-        if (options.endpoint.empty()) {
+        if (options.endpoint.empty() && options.qemu_executable.empty()) {
           state.error =
               l10n::text(l10n::Key::EngineRemoteConnectionRequiresAnEndpoint);
           publish();
@@ -4234,18 +4490,60 @@ void LldbEngine::run() {
         open_target_session();
 
         std::string endpoint = std::move(options.endpoint);
-        if (endpoint.find("://") == std::string::npos) {
+        if (options.qemu_executable.empty() &&
+            endpoint.find("://") == std::string::npos) {
           endpoint.insert(0, "connect://");
+        }
+        if (!options.qemu_executable.empty()) {
+          // Engine-owned qemu-user stub: spawn, own the target's stdin, and
+          // connect. Symbol breakpoints resolve through the engine's ELF
+          // symbol table (LLDB 21 cannot bind pending breakpoints over
+          // gdb-remote).
+          std::string spawn_failure;
+          const auto port = pick_stub_port(spawn_failure);
+          if (!port) {
+            state.state = SessionState::Error;
+            state.error = l10n::format(l10n::Key::EngineQemuPortUnavailable,
+                                       spawn_failure.c_str());
+            publish();
+            break;
+          }
+          const auto child = spawn_qemu_stub(
+              options.qemu_executable, options.sysroot, options.executable,
+              options.arguments, options.working_directory,
+              options.stdin_file, *port, spawn_failure);
+          if (!child) {
+            state.state = SessionState::Error;
+            state.error = l10n::format(l10n::Key::EngineQemuSpawnFailed,
+                                       spawn_failure.c_str());
+            publish();
+            break;
+          }
+          qemu_pid_ = child->pid;
+          qemu_stdin_fd_ = child->stdin_fd;
+          qemu_stdout_fd_ = child->stdout_fd;
+          if (!wait_stub_listen(*port)) {
+            stop_qemu_child();
+            state.state = SessionState::Error;
+            state.error = l10n::format(
+                l10n::Key::EngineQemuSpawnFailed,
+                "the gdbstub port never listened");
+            publish();
+            break;
+          }
+          endpoint = "connect://127.0.0.1:" + std::to_string(*port);
         }
         state.state = SessionState::Connecting;
         publish();
         lldb::SBError connect_error;
         connect_remote_process(endpoint, connect_error);
         if (shutdown_requested_.load()) {
+          stop_qemu_child();
           state.error = l10n::text(l10n::Key::EngineRemoteConnectionCancelled);
           break;
         }
         if (connect_error.Fail() || !process.IsValid()) {
+          stop_qemu_child();
           state.state = SessionState::Error;
           state.error = error_text(connect_error);
           publish();
@@ -4268,6 +4566,7 @@ void LldbEngine::run() {
           publish();
           break;
         }
+        stop_qemu_child();
         adopt_process(lldb::SBProcess{});
         state.state = target.IsValid() ? SessionState::TargetLoaded
                                        : SessionState::NoTarget;
@@ -4297,6 +4596,7 @@ void LldbEngine::run() {
         break;
       case CommandKind::Terminate:
         terminate_impl();
+        stop_qemu_child();
         publish();
         break;
       case CommandKind::SetConditionalBreakpoint:
@@ -4582,6 +4882,30 @@ void LldbEngine::run() {
         break;
       }
       case CommandKind::SendStdin: {
+        if (qemu_stdin_fd_ >= 0) {
+          // Engine-owned qemu-user stub: the target's stdin is our pipe.
+          std::size_t written = 0;
+          while (written < command.argument.size()) {
+            const ssize_t count = write(qemu_stdin_fd_,
+                                        command.argument.data() + written,
+                                        command.argument.size() - written);
+            if (count < 0 && errno != EINTR) {
+              state.error = l10n::format(
+                  l10n::Key::EngineQemuStdinFailed, strerror(errno));
+              publish();
+              break;
+            }
+            if (count >= 0) {
+              written += static_cast<std::size_t>(count);
+            }
+          }
+          if (state.error.empty()) {
+            command_message = l10n::format(l10n::Key::EngineSentInputBytes,
+                                           command.argument.size());
+          }
+          publish();
+          break;
+        }
         if (!process.IsValid() || state.state == SessionState::Exited) {
           state.error = l10n::text(l10n::Key::EngineNoLiveProcessAcceptsStdin);
         } else {
@@ -4742,6 +5066,7 @@ void LldbEngine::run() {
         state.exit_status = process.GetExitStatus();
         state.stop_reason = safe_string(process.GetExitDescription());
         state.error.clear();
+        drain_qemu_stdout();
       }
       publish();
     }
@@ -4749,12 +5074,15 @@ void LldbEngine::run() {
     if (append_process_output(process, state)) {
       publish();
     }
+    drain_qemu_stdout();
+    publish();
 
     std::unique_lock lock{mutex_};
     wake_.wait_for(lock, 10ms, [this] { return !commands_.empty(); });
   }
 
   save_session();
+  stop_qemu_child();
   state.state = SessionState::ShuttingDown;
   publish();
   if (process.IsValid() && should_destroy(process.GetState())) {

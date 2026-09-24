@@ -889,6 +889,24 @@ if(BUILD_TESTING)
     SKIP_RETURN_CODE 77
     PASS_REGULAR_EXPRESSION "symbolic-solver-ok"
   )
+  foreach(emporium_test IN ITEMS ret2win_x64 ret2win_i386 ret2win_arm split_x64 callme_x64 write4_x64)
+    string(REPLACE "_" "-" emporium_marker "${emporium_test}")
+    add_test(
+      NAME rop_emporium_${emporium_test}
+      COMMAND "${Python_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/symbolic_solver.py"
+        --mydbg $<TARGET_FILE:mydbg>
+        --script "${CMAKE_CURRENT_SOURCE_DIR}/examples/rop_emporium/solve_${emporium_test}.py"
+        --target "$<TARGET_FILE:debuggee_crackme_x86_64>"
+        --timeout-seconds 300
+        --expect "${emporium_marker}-solve-ok"
+    )
+    set_tests_properties(rop_emporium_${emporium_test} PROPERTIES
+      TIMEOUT 420
+      SKIP_RETURN_CODE 77
+      PASS_REGULAR_EXPRESSION "symbolic-solver-ok"
+    )
+  endforeach()
   add_test(
     NAME symbolic_script_keygen
     COMMAND "${Python_EXECUTABLE}"

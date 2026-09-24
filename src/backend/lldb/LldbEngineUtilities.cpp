@@ -268,6 +268,126 @@ std::string format_hexdump(lldb::addr_t address,
   return output.str();
 }
 
+// FUNC symbol names and values from the target image's .symtab and .dynsym.
+// Used for engine-side breakpoint symbol resolution on remote/qemu sessions,
+// where LLDB cannot bind symbol breakpoints before the image maps (qemu-user
+// stops at the dynamic loader). Non-PIE images use the value as-is; PIE
+// values need the runtime base, which the caller resolves from the module
+// list once the image is mapped.
+std::vector<ElfSymbol> read_elf_symbols(const std::filesystem::path &path) {
+  std::vector<ElfSymbol> symbols;
+  std::ifstream file{path, std::ios::binary};
+  const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>{file},
+                                        std::istreambuf_iterator<char>{}};
+  if (bytes.size() < EI_NIDENT || bytes[EI_MAG0] != ELFMAG0 ||
+      bytes[EI_MAG1] != ELFMAG1 || bytes[EI_MAG2] != ELFMAG2 ||
+      bytes[EI_MAG3] != ELFMAG3) {
+    return symbols;
+  }
+  const bool elf64 = bytes[EI_CLASS] == ELFCLASS64;
+  const bool big_endian = bytes[EI_DATA] == ELFDATA2MSB;
+  if (!elf64 && bytes[EI_CLASS] != ELFCLASS32) {
+    return symbols;
+  }
+  const auto read_value =
+      [&bytes, big_endian](std::size_t offset,
+                           std::size_t size) -> std::optional<std::uint64_t> {
+    if (size == 0 || size > 8 || offset > bytes.size() ||
+        size > bytes.size() - offset) {
+      return std::nullopt;
+    }
+    return decode_pointer(bytes.data() + offset, static_cast<std::uint32_t>(size),
+                          big_endian ? lldb::eByteOrderBig
+                                     : lldb::eByteOrderLittle);
+  };
+  const auto read_required = [&read_value](std::size_t offset,
+                                           std::size_t size) -> std::uint64_t {
+    return read_value(offset, size).value_or(0);
+  };
+
+  const std::size_t header_size = elf64 ? sizeof(Elf64_Ehdr) : sizeof(Elf32_Ehdr);
+  if (bytes.size() < header_size) {
+    return symbols;
+  }
+  const std::size_t section_offset = static_cast<std::size_t>(
+      read_required(elf64 ? 0x28 : 0x20, elf64 ? 8 : 4));
+  const std::size_t section_entry = static_cast<std::size_t>(
+      read_required(elf64 ? 0x3A : 0x2E, 2));
+  const std::size_t section_count = static_cast<std::size_t>(
+      read_required(elf64 ? 0x3C : 0x30, 2));
+  if (section_count == 0 || section_entry == 0 ||
+      section_offset > bytes.size() ||
+      section_entry > bytes.size() - section_offset) {
+    return symbols;
+  }
+
+  std::size_t symbol_size = elf64 ? sizeof(Elf64_Sym) : sizeof(Elf32_Sym);
+  for (std::size_t index = 0; index < section_count; ++index) {
+    const std::size_t base = section_offset + index * section_entry;
+    const std::size_t header_size = elf64 ? 0x40 : 0x28;
+    if (base > bytes.size() || header_size > bytes.size() - base) {
+      continue;
+    }
+    const std::size_t type = static_cast<std::size_t>(
+        read_required(base + (elf64 ? 0x04 : 0x04), 4));
+    if (type != SHT_SYMTAB && type != SHT_DYNSYM) {
+      continue;
+    }
+    // Read every symbol table: .dynsym has imports, .symtab has locals such
+    // as the challenge functions; both are useful for breakpoints.
+    const std::size_t offset = static_cast<std::size_t>(
+        read_required(base + (elf64 ? 0x18 : 0x10), elf64 ? 8 : 4));
+    const std::size_t table_bytes = static_cast<std::size_t>(
+        read_required(base + (elf64 ? 0x20 : 0x14), elf64 ? 8 : 4));
+    const std::size_t linked = static_cast<std::size_t>(
+        read_required(base + (elf64 ? 0x28 : 0x18), 4));
+    if (offset > bytes.size() || table_bytes > bytes.size() - offset) {
+      continue;
+    }
+    const std::size_t string_base = section_offset + linked * section_entry;
+    const std::size_t string_offset = static_cast<std::size_t>(
+        read_required(string_base + (elf64 ? 0x18 : 0x10), elf64 ? 8 : 4));
+    const std::size_t string_size = static_cast<std::size_t>(
+        read_required(string_base + (elf64 ? 0x20 : 0x14), elf64 ? 8 : 4));
+    if (string_offset > bytes.size() ||
+        string_size > bytes.size() - string_offset) {
+      continue;
+    }
+    const std::size_t count = table_bytes / symbol_size;
+    symbols.reserve(std::min<std::size_t>(symbols.size() + count, 131072));
+    for (std::size_t item = 0; item < count; ++item) {
+      const std::size_t entry = offset + item * symbol_size;
+      const std::uint64_t info = read_required(entry + (elf64 ? 0x04 : 0x0C), 1);
+      if ((info & 0xF) != STT_FUNC) {
+        continue;
+      }
+      const std::size_t name_offset = static_cast<std::size_t>(
+          read_required(entry, 4));
+      if (name_offset >= string_size) {
+        continue;
+      }
+      const char *start = reinterpret_cast<const char *>(
+          bytes.data() + string_offset + name_offset);
+      const char *limit = reinterpret_cast<const char *>(
+          bytes.data() + string_offset + string_size);
+      std::string_view name{start, static_cast<std::size_t>(limit - start)};
+      const std::size_t nul = name.find('\0');
+      if (nul != std::string_view::npos) {
+        name = name.substr(0, nul);
+      }
+      if (name.empty()) {
+        continue;
+      }
+      symbols.push_back(ElfSymbol{
+          .name = std::string{name},
+          .value = read_required(entry + (elf64 ? 0x08 : 0x04),
+                                 elf64 ? 8 : 4),
+      });
+    }
+  }
+  return symbols;
+}
+
 ElfSecurityInfo inspect_elf_security(const std::filesystem::path &path) {
   ElfSecurityInfo result;
   std::ifstream file{path, std::ios::binary};

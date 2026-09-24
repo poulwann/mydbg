@@ -318,12 +318,25 @@ struct LaunchOptions {
   std::vector<std::string> environment{};
   std::string working_directory{};
   LaunchStopPolicy stop_policy{LaunchStopPolicy::Main};
+  // When non-empty the inferior's stdin is read from this file (LLDB's
+  // target.input-path), which delivers raw bytes a pty would corrupt.
+  std::string stdin_path{};
 };
 
 struct RemoteOptions {
   std::string executable{};
   std::string endpoint{};
   SessionMode mode{SessionMode::Remote};
+  // When qemu_executable is non-empty the engine spawns qemu-user itself
+  // (qemu -g port [-L sysroot] target args), owns its stdin, connects to the
+  // stub, and tears the stub down with the session. send_stdin then reaches
+  // the target through the owned pipe; stdin_file redirects the target's
+  // stdin to a file instead.
+  std::string qemu_executable{};
+  std::string sysroot{};
+  std::vector<std::string> arguments{};
+  std::string working_directory{};
+  std::string stdin_file{};
 };
 
 enum class OutputStream {
@@ -598,6 +611,14 @@ private:
   std::deque<Command> commands_;
   CommandId next_command_id_{1};
   std::atomic_bool shutdown_requested_{false};
+  // Engine-owned qemu-user stub; touched only on the command thread.
+  pid_t qemu_pid_{-1};
+  int qemu_stdin_fd_{-1};
+  int qemu_stdout_fd_{-1};
+  // Main-image ELF symbols (name, value) for engine-side breakpoint
+  // resolution on remote sessions (lazy cache keyed by the symbol file path).
+  std::vector<std::pair<std::string, std::uint64_t>> main_symbols_;
+  std::string main_symbols_path_;
   SessionSnapshot snapshot_;
   std::shared_ptr<SessionStore> sessions_;
   std::unique_ptr<WorkerControl> worker_control_;
