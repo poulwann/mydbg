@@ -1,0 +1,8 @@
+# Optional symbolic-execution backend for mydbg (docs/manual/11-symbolic-execution.md).
+#
+# Install into the interpreter that LLDB reports with:
+#   lldb --print-script-interpreter-info
+# scripts/bootstrap-symbolic.sh does this automatically. angr 9.2.223 ships
+# cp312-abi3 wheels, so any CPython >= 3.12 works, including 3.13/3.14.
+angr==9.2.223
+angrop==9.2.12.post3
