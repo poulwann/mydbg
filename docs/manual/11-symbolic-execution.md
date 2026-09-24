@@ -141,6 +141,57 @@ keeps the frontier small on branchy targets) plus the same hard caps. For
 input-format constraints beyond `printable`/`prefix`, apply them directly:
 `state.solver.add(variable.get_bytes(0, 5) == b"flag{")`.
 
+### Unicorn fast path
+
+`unicorn=True` on `solve_entry_stdin` (and any state you build yourself, via
+`angr.options.unicorn`) runs concrete stretches on the Unicorn engine —
+roughly 10-100x faster on compute-heavy targets with symbolic boundaries. It
+needs the `unicorn` package from `requirements-symbolic.txt`; angr does not
+declare that dependency and silently disables the engine without it.
+
+## Trace-guided solving
+
+Record the concrete run and replay it symbolically, then solve the input from
+the point the concrete run already reached — the fastest route into far-away
+decision points:
+
+```python
+dbg.launch(["./crackme", "wrong"], stop_at="main")
+dbg.set_breakpoint("crackme_entry")
+dbg.continue_execution()
+dbg.wait_for_stop(timeout=5)
+
+verify = symbolic.resolve_symbol(dbg, "crackme_verify")
+dbg.set_breakpoint("crackme_verify")
+success = symbolic.resolve_symbol(dbg, "crackme_success")
+
+solution = symbolic.trace_way(
+    dbg,
+    symbolize=["reg:edi"],   # the argument at the traced point
+    find=success,
+    stop_at=verify,          # the recording stops here
+    max_trace_steps=2000,
+)
+print(solution.summary())
+solution.apply(dbg)          # the live session sits at the traced point
+```
+
+- `record_trace` single-steps the live session (LLDB round-trips make this
+  seconds-scale — trace the interesting span, not whole programs).
+- `reduce_trace_blocks` converts the instruction trace to basic-block heads
+  by lifting block boundaries from the image; instruction-patched regions
+  should not be traced (the lifted sizes come from the on-disk bytes).
+- The replay is an explicit block-following loop: every step must land on the
+  next recorded block, and strays land in the manager's `desync` stash with a
+  diagnostic instead of silently derailing.
+- Symbolize **at the traced point**, not before: values the concrete run
+  already consumed (spilled arguments, read buffers) are dead by the time the
+  trace ends. Symbolize the register or memory the remaining code reads.
+- `Solution.model_int(name)` evaluates a register model endianness-free;
+  `eval(cast_to=bytes)` follows bit order, not target byte order.
+
+See `examples/solve_trace.py`.
+
 ## ROP with angrop
 
 `mydbg.rop` wraps angrop's ROP analysis for the ret2win/exploit iteration
