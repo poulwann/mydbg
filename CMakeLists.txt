@@ -412,6 +412,11 @@ if(BUILD_TESTING)
     -g -O0 -fno-omit-frame-pointer -fno-optimize-sibling-calls
     $<$<C_COMPILER_ID:Clang,GNU>:-Wall;-Wextra;-Wpedantic;-Wconversion;-Wshadow>
   )
+  add_executable(debuggee_rop_target tests/debuggees/rop_target.c)
+  target_compile_options(debuggee_rop_target PRIVATE
+    -g -O0 -fno-stack-protector -fno-omit-frame-pointer -no-pie
+  )
+  target_link_options(debuggee_rop_target PRIVATE -no-pie)
 
   set(MYDBG_CROSS_FIXTURE_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/cross-architecture-fixtures"
@@ -825,6 +830,21 @@ if(BUILD_TESTING)
       --expect "crackme solved symbolically"
   )
   set_tests_properties(symbolic_script_x86_64 PROPERTIES
+    TIMEOUT 420
+    SKIP_RETURN_CODE 77
+    PASS_REGULAR_EXPRESSION "symbolic-solver-ok"
+  )
+  add_test(
+    NAME rop_script_x86_64
+    COMMAND "${Python_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/symbolic_solver.py"
+      --mydbg $<TARGET_FILE:mydbg>
+      --script "${CMAKE_CURRENT_SOURCE_DIR}/examples/rop_crackme.py"
+      --target "$<TARGET_FILE:debuggee_rop_target>"
+      --timeout-seconds 240
+      --expect "rop-loop-ok"
+  )
+  set_tests_properties(rop_script_x86_64 PROPERTIES
     TIMEOUT 420
     SKIP_RETURN_CODE 77
     PASS_REGULAR_EXPRESSION "symbolic-solver-ok"
