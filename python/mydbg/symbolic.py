@@ -72,6 +72,30 @@ def _register_candidates(name: str) -> list[str]:
     return candidates
 
 
+# First-argument register, return-value register, and return-address register
+# per angr architecture name. X86 (32-bit cdecl) passes arguments on the stack
+# and is deliberately unsupported by call_way.
+_ARGUMENT_REGISTERS = {
+    "AMD64": "rdi",
+    "ARMEL": "r0",
+    "ARMHF": "r0",
+    "MIPS32": "a0",
+    "PPC32": "r3",
+}
+_RETURN_REGISTERS = {
+    "AMD64": "rax",
+    "ARMEL": "r0",
+    "ARMHF": "r0",
+    "MIPS32": "v0",
+    "PPC32": "r3",
+}
+_RETURN_ADDRESS_REGISTERS = {
+    "ARMEL": "lr",
+    "ARMHF": "lr",
+    "MIPS32": "ra",
+    "PPC32": "lr",
+}
+
 @dataclass(frozen=True)
 class ConversionNotes:
     """Diagnostics from building a SimState out of a live stop."""
@@ -329,16 +353,24 @@ def _bounded_technique(angr, deadline: float, max_steps: int, max_states: int,
     return Bounded()
 
 
-def explore(project, state, find, avoid: Sequence[int] = (), *, timeout: float = 60.0,
+def explore(project, state, find, avoid: Sequence = (), *, timeout: float = 60.0,
             max_steps: int = 20000, max_states: int = 4000,
-            cancel: Callable[[], bool] | None = None) -> tuple[object, ExplorationResult]:
+            cancel: Callable[[], bool] | None = None,
+            technique: str = "bfs") -> tuple[object, ExplorationResult]:
     """Explore from ``state`` toward ``find`` under hard bounds.
 
-    ``find`` is an address, a sequence of addresses, or a state predicate.
+    ``find`` is an address, a sequence of addresses, or a state predicate;
+    ``avoid`` accepts the same forms. ``technique`` selects angr's traversal
+    (``bfs`` or ``dfs``); DFS keeps the frontier small for branchy targets.
     Returns the final ``SimulationManager`` plus a summary result; the manager
     keeps every stash, so partial work is never thrown away.
     """
     simgr = project.factory.simgr(state)
+    traversal = technique
+    if traversal == "dfs":
+        simgr.use_technique(_import_angr()[0].exploration_techniques.DFS())
+    elif traversal != "bfs":
+        raise ValueError(f"unknown exploration technique {traversal!r}")
     deadline = time.time() + timeout
     technique = _bounded_technique(_import_angr()[0], deadline,
                                    max_steps, max_states, cancel)
@@ -563,7 +595,199 @@ def import_ktest(path: str) -> dict[str, bytes]:
     return objects
 
 
-# --- Script generation --------------------------------------------------------
+# --- Input-space solves: symbolic stdin and call-state keygens ---------------
+
+
+@dataclass
+class InputSolution:
+    """A solve whose result is input bytes (stdin content, a serial, ...).
+
+    Unlike ``Solution``, the model cannot be written into live memory with
+    ``apply()``; feed it to the target instead — a file named in argv is the
+    reliable channel (mydbg's pty stdin corrupts binary bytes), and
+    ``mydbg.rop.test_landing``/``relaunch`` close the loop against the live
+    process.
+    """
+
+    status: str
+    input_bytes: bytes = b""
+    variable: object = None
+    result: ExplorationResult | None = None
+    manager: object = None
+
+    def summary(self) -> str:
+        lines = [f"status: {self.status}"]
+        if self.result is not None:
+            lines.append(
+                f"steps={self.result.steps} deadended={self.result.deadended} "
+                f"avoided={self.result.avoided} errored={self.result.errored}"
+            )
+        if self.input_bytes:
+            printable = all(0x20 <= b <= 0x7e for b in self.input_bytes)
+            lines.append("input: " + (self.input_bytes.decode("ascii")
+                                      if printable else self.input_bytes.hex()))
+        return "\n".join(lines)
+
+
+def constrain_printable(state, variable) -> None:
+    """Add per-byte printable-ASCII constraints (0x20..0x7e) to a byte variable."""
+    for index in range(variable.length // 8):
+        byte = variable.get_byte(index)
+        state.solver.add(byte >= 0x20)
+        state.solver.add(byte <= 0x7e)
+
+
+def constrain_exact(state, variable, value: bytes) -> None:
+    """Constrain the variable's leading bytes to ``value``."""
+    variable_bytes = variable.length // 8
+    if len(value) > variable_bytes:
+        raise ValueError(f"prefix {len(value)} bytes exceeds {variable_bytes}")
+    if value:
+        state.solver.add(variable.get_bytes(0, len(value)) == value)
+
+
+def _entry_project(dbg, snapshot=None, binary: str | None = None):
+    """Project for from-entry solves: the live target's image, no libraries."""
+    angr, _ = _import_angr()
+    if binary is None:
+        if snapshot is None:
+            snapshot = dbg.snapshot()
+        binary = snapshot.target_path
+    if not binary:
+        raise RuntimeError("no target image available for an entry-state solve")
+    return angr.Project(binary, auto_load_libs=False)
+
+
+def resolve_project_symbol(project, name: str) -> int:
+    """Resolve a symbol to its rebased address straight from the angr project.
+
+    Works without a live session, which is what from-entry solves need.
+    """
+    symbol = project.loader.main_object.get_symbol(name)
+    if symbol is None or not symbol.rebased_addr:
+        raise RuntimeError(f"symbol {name!r} not found in the loaded image")
+    return symbol.rebased_addr
+
+
+def solve_entry_stdin(
+    dbg,
+    find,
+    *,
+    size: int = 32,
+    avoid: Sequence = (),
+    printable: bool = True,
+    prefix: bytes = b"",
+    binary: str | None = None,
+    timeout: float = 120.0,
+    max_steps: int = 20000,
+    max_states: int = 4000,
+    technique: str = "bfs",
+) -> InputSolution:
+    """Explore from the target's entry with symbolic stdin (the classic CTF
+    flag-finder pattern).
+
+    ``find``/``avoid`` take addresses or state predicates. With ``printable``
+    the stdin bytes are constrained to printable ASCII up front, which prunes
+    the space before exploration starts. The solved input comes back as
+    ``InputSolution.input_bytes``; verify it against the live process with a
+    relaunch (see ``mydbg.rop``).
+    """
+    angr, claripy = _import_angr()
+    project = _entry_project(dbg, binary=binary)
+    variable = claripy.BVS("stdin", size * 8)
+    state = project.factory.entry_state(
+        stdin=angr.SimPackets("stdin", content=[variable]))
+    if printable:
+        constrain_printable(state, variable)
+    constrain_exact(state, variable, prefix)
+    simgr, result = explore(project, state, find, avoid=avoid, timeout=timeout,
+                            max_steps=max_steps, max_states=max_states,
+                            technique=technique)
+    solution = InputSolution(status=result.status, variable=variable,
+                             result=result, manager=simgr)
+    if simgr.found:
+        solution.input_bytes = simgr.found[0].solver.eval(variable, cast_to=bytes)
+    return solution
+
+
+def call_way(
+    dbg,
+    function: int,
+    *,
+    size: int = 16,
+    find=None,
+    avoid: Sequence = (),
+    printable: bool = True,
+    require_nonzero_return: bool = True,
+    timeout: float = 120.0,
+    max_steps: int = 20000,
+    max_states: int = 4000,
+    technique: str = "bfs",
+) -> InputSolution:
+    """The keygen pattern: call ``function`` with a symbolic first argument.
+
+    The symbolic argument lives in freshly symbolized memory below SP (well
+    clear of the callee's frame), NUL-terminated; execution returns to a
+    sentinel address. The default success condition is "the call returned and
+    a nonzero return value is satisfiable", i.e. the serial exists. Resolves
+    the model from the current stopped session so live globals and bases are
+    consistent.
+    """
+    angr, claripy = _import_angr()
+    project, state, _notes = state_from_debugger(dbg)
+    arch_name = project.arch.name
+    if arch_name not in _ARGUMENT_REGISTERS:
+        raise RuntimeError(f"call_way does not support architecture {arch_name}")
+
+    def abi_register(name: str) -> str:
+        for candidate in _register_candidates(name):
+            if candidate in state.arch.registers:
+                return candidate
+        raise RuntimeError(f"register {name!r} missing for {arch_name}")
+
+    variable = claripy.BVS("serial", size * 8)
+    argument_address = state.solver.eval(state.regs.sp) - 0x2000
+    state.memory.store(argument_address, variable)
+    state.solver.add(variable.get_byte(size - 1) == 0)  # NUL terminator
+    if printable:
+        for index in range(size - 1):
+            byte = variable.get_byte(index)
+            state.solver.add(byte >= 0x21)
+            state.solver.add(byte <= 0x7e)
+    state.registers.store(state.arch.ip_offset, function)
+    state.registers.store(abi_register(_ARGUMENT_REGISTERS[arch_name]),
+                          argument_address)
+
+    sentinel = 0xC0DEBEEF
+    if arch_name in _RETURN_ADDRESS_REGISTERS:
+        state.registers.store(
+            abi_register(_RETURN_ADDRESS_REGISTERS[arch_name]), sentinel)
+    else:
+        # amd64/x86: a call pushes the return address onto the stack.
+        state.regs.sp = state.solver.eval(state.regs.sp) - state.arch.bytes
+        state.memory.store(state.solver.eval(state.regs.sp),
+                           sentinel.to_bytes(state.arch.bytes, "little"))
+
+    return_register = abi_register(_RETURN_REGISTERS[arch_name])
+    if find is None and require_nonzero_return:
+        def find(candidate):  # noqa: F811 - matches the angr predicate API
+            if candidate.addr != sentinel:
+                return False
+            value = getattr(candidate.regs, return_register)
+            if value.symbolic:
+                return candidate.solver.satisfiable(
+                    extra_constraints=[value != 0])
+            return candidate.solver.eval(value) != 0
+
+    simgr, result = explore(project, state, find, avoid=avoid, timeout=timeout,
+                            max_steps=max_steps, max_states=max_states,
+                            technique=technique)
+    solution = InputSolution(status=result.status, variable=variable,
+                             result=result, manager=simgr)
+    if simgr.found:
+        solution.input_bytes = simgr.found[0].solver.eval(variable, cast_to=bytes)
+        solution.input_bytes = solution.input_bytes.rstrip(b"\x00")
+    return solution
 
 
 def generate_script(

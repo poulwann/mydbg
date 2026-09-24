@@ -418,6 +418,15 @@ if(BUILD_TESTING)
     -g -O0 -fno-stack-protector -fno-omit-frame-pointer -no-pie
   )
   target_link_options(debuggee_rop_target PRIVATE -no-pie)
+  add_executable(debuggee_symbolic_stdin tests/debuggees/symbolic_stdin.c)
+  target_compile_options(debuggee_symbolic_stdin PRIVATE
+    -g -O0 -fno-stack-protector -fno-omit-frame-pointer
+  )
+  add_executable(debuggee_keygenme tests/debuggees/keygenme.c)
+  target_compile_options(debuggee_keygenme PRIVATE
+    -g -O0 -fno-stack-protector -fno-omit-frame-pointer -no-pie
+  )
+  target_link_options(debuggee_keygenme PRIVATE -no-pie)
 
   set(MYDBG_CROSS_FIXTURE_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/cross-architecture-fixtures"
@@ -847,6 +856,36 @@ if(BUILD_TESTING)
   )
   set_tests_properties(rop_script_x86_64 PROPERTIES
     TIMEOUT 420
+    SKIP_RETURN_CODE 77
+    PASS_REGULAR_EXPRESSION "symbolic-solver-ok"
+  )
+  add_test(
+    NAME symbolic_script_stdin
+    COMMAND "${Python_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/symbolic_solver.py"
+      --mydbg $<TARGET_FILE:mydbg>
+      --script "${CMAKE_CURRENT_SOURCE_DIR}/examples/solve_stdin.py"
+      --target "$<TARGET_FILE:debuggee_symbolic_stdin>"
+      --timeout-seconds 420
+      --expect "stdin-solve-ok"
+  )
+  set_tests_properties(symbolic_script_stdin PROPERTIES
+    TIMEOUT 600
+    SKIP_RETURN_CODE 77
+    PASS_REGULAR_EXPRESSION "symbolic-solver-ok"
+  )
+  add_test(
+    NAME symbolic_script_keygen
+    COMMAND "${Python_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/symbolic_solver.py"
+      --mydbg $<TARGET_FILE:mydbg>
+      --script "${CMAKE_CURRENT_SOURCE_DIR}/examples/solve_keygen.py"
+      --target "$<TARGET_FILE:debuggee_keygenme>"
+      --timeout-seconds 420
+      --expect "keygen-solve-ok"
+  )
+  set_tests_properties(symbolic_script_keygen PROPERTIES
+    TIMEOUT 600
     SKIP_RETURN_CODE 77
     PASS_REGULAR_EXPRESSION "symbolic-solver-ok"
   )
