@@ -47,3 +47,6 @@ Thumbs.db
 *.core
 examples/rop_emporium/rop_emporium/rop_emporium_all_challenges.zip
 examples/rop_emporium/rop_emporium_all_challenges.zip
+
+# challenge runtime fixture (copied for the mipsel system() child)
+examples/rop_emporium/flag.txt
