@@ -2,12 +2,13 @@
 #include "app/AppActions.h"
 #include "app/AppMenus.h"
 #include "app/AppState.h"
-#include "app/DebuggerController.h"
 #include "app/DebuggerPanels.h"
 #include "app/DisassemblyText.h"
+#include "app/MemoryController.h"
 #include "app/MemoryData.h"
 #include "app/MemoryInspection.h"
 #include "app/UiSupport.h"
+#include "backend/lldb/LldbEngine.h"
 #include "localization/Localization.h"
 
 #include <imgui_internal.h>
@@ -34,8 +35,8 @@ std::string memory_string_at(const debugger::SessionSnapshot &snapshot,
 } // namespace
 
 void draw_typed_memory_hints(const debugger::SessionSnapshot &snapshot,
-                             UiState &ui) {
-  const auto dump_end = debugger_memory_visible_hint_end(snapshot, ui);
+                             MemoryState &state) {
+  const auto dump_end = debugger_memory_visible_hint_end(snapshot, state);
   if (!dump_end) {
     return;
   }
@@ -44,7 +45,7 @@ void draw_typed_memory_hints(const debugger::SessionSnapshot &snapshot,
           ImGuiTreeNodeFlags_DefaultOpen)) {
     return;
   }
-  for (const MemoryTypeHint &hint : ui.memory_type_hints) {
+  for (const MemoryTypeHint &hint : state.type_hints) {
     if (hint.address < snapshot.memory_base || hint.address >= *dump_end) {
       continue;
     }
@@ -100,38 +101,38 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
   ImGui::Begin(l10n::label(l10n::Key::WindowMemoryDump));
   const bool controls_locked = (ImGui::GetCurrentContext()->CurrentItemFlags &
                                 ImGuiItemFlags_Disabled) != 0;
-  const bool dump_changed = debugger_sync_memory_selection(snapshot, ui);
+  const bool dump_changed = debugger_sync_memory_selection(snapshot, ui.memory);
   // The final motion and release can arrive in the same frame. Consume that
   // position before ending the selection gesture.
   const bool selection_released = ImGui::IsMouseReleased(ImGuiMouseButton_Left);
   if (controls_locked ||
       (!ImGui::IsMouseDown(ImGuiMouseButton_Left) && !selection_released)) {
-    ui.memory_selection_dragging = false;
+    ui.memory.selection_dragging = false;
   }
   const auto copy_bytes = [&](MemoryCopyFormat format, MemoryByteOrder order,
                               std::size_t word_size) {
-    if (debugger_memory_has_selection(snapshot, ui)) {
+    if (debugger_memory_has_selection(snapshot, ui.memory)) {
       if (const auto text = format_memory_bytes(
-              debugger_memory_selected_bytes(snapshot, ui), format, order,
-              word_size, snapshot.byte_order)) {
+              debugger_memory_selected_bytes(snapshot, ui.memory), format,
+              order, word_size, snapshot.byte_order)) {
         ImGui::SetClipboardText(text->c_str());
       }
     }
   };
-  const bool edit_mode_at_frame_start = ui.memory_edit_mode;
+  const bool edit_mode_at_frame_start = ui.memory.edit_mode;
   const bool submitted = ImGui::InputTextWithHint(
       "##memory-address", l10n::text(l10n::Key::GuiPanelsMemoryAddressHint),
-      ui.memory_address.data(), ui.memory_address.size(),
+      ui.memory.address.data(), ui.memory.address.size(),
       ImGuiInputTextFlags_EnterReturnsTrue);
   ImGui::SameLine();
   if (submitted || ImGui::Button(l10n::label(l10n::Key::GuiPanelsGo))) {
-    engine.execute_command(std::string{"dump "} + ui.memory_address.data());
+    engine.execute_command(std::string{"dump "} + ui.memory.address.data());
   }
   ImGui::SameLine();
   ImGui::BeginDisabled(controls_locked ||
                        snapshot.state != debugger::SessionState::Stopped);
   if (ImGui::Button(l10n::label(l10n::Key::GuiPanelsStack))) {
-    follow_memory(engine, ui, snapshot.sp);
+    follow_memory(engine, ui.memory, snapshot.sp);
   }
   ImGui::EndDisabled();
   ImGui::SameLine();
@@ -139,26 +140,26 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
                         snapshot.state == debugger::SessionState::Stopped &&
                         !snapshot.memory.empty();
   if (!can_edit) {
-    ui.memory_edit_mode = false;
-    ui.memory_edit_focus.reset();
+    ui.memory.edit_mode = false;
+    ui.memory.edit_focus.reset();
   }
   const auto draw_edit_mode_action = [&] {
     if (ImGui::MenuItem(
-            ui.memory_edit_mode
+            ui.memory.edit_mode
                 ? l10n::label(l10n::Key::GuiPanelsLeaveMemoryEditMode)
                 : l10n::label(l10n::Key::GuiPanelsEnterMemoryEditMode),
             nullptr, false, can_edit)) {
-      ui.memory_edit_mode = !ui.memory_edit_mode;
-      if (!ui.memory_edit_mode) {
-        ui.memory_edit_focus.reset();
+      ui.memory.edit_mode = !ui.memory.edit_mode;
+      if (!ui.memory.edit_mode) {
+        ui.memory.edit_focus.reset();
       }
     }
   };
   ImGui::BeginDisabled(!can_edit);
   if (ImGui::Checkbox(l10n::label(l10n::Key::GuiPanelsEdit),
-                      &ui.memory_edit_mode) &&
-      !ui.memory_edit_mode) {
-    ui.memory_edit_focus.reset();
+                      &ui.memory.edit_mode) &&
+      !ui.memory.edit_mode) {
+    ui.memory.edit_focus.reset();
   }
   ImGui::EndDisabled();
   if (ImGui::IsItemHovered()) {
@@ -169,24 +170,26 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
                       snapshot.patches.size());
 
   const std::size_t editable_count =
-      std::min(ui.memory_edit_bytes.size(), snapshot.memory.size());
-  debugger_sync_memory_editor(snapshot, ui, dump_changed, editable_count);
-  draw_error_text(ui.memory_edit_error);
-  draw_typed_memory_hints(snapshot, ui);
+      std::min(ui.memory.edit_bytes.size(), snapshot.memory.size());
+  debugger_sync_memory_editor(snapshot, ui.memory, dump_changed,
+                              editable_count);
+  draw_error_text(ui.memory.edit_error);
+  draw_typed_memory_hints(snapshot, ui.memory);
   ImGui::PushStyleColor(ImGuiCol_Text,
                         ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
   ImGui::TextWrapped("%s", l10n::text(l10n::Key::GuiPanelsMemorySelectionHelp));
   ImGui::PopStyleColor();
-  if (ui.memory_edit_mode && editable_count < snapshot.memory.size()) {
+  if (ui.memory.edit_mode && editable_count < snapshot.memory.size()) {
     ImGui::TextDisabled(l10n::text(l10n::Key::GuiPanelsMemoryEditLimit),
                         editable_count);
   }
-  if (debugger_memory_has_selection(snapshot, ui)) {
+  if (debugger_memory_has_selection(snapshot, ui.memory)) {
     ImGui::Text(l10n::text(l10n::Key::GuiPanelsMemorySelection),
-                snapshot.memory_base + debugger_memory_selection_start(ui),
-                snapshot.memory_base + debugger_memory_selection_end(ui),
-                debugger_memory_selection_end(ui) -
-                    debugger_memory_selection_start(ui) + 1);
+                snapshot.memory_base +
+                    debugger_memory_selection_start(ui.memory),
+                snapshot.memory_base + debugger_memory_selection_end(ui.memory),
+                debugger_memory_selection_end(ui.memory) -
+                    debugger_memory_selection_start(ui.memory) + 1);
   } else {
     ImGui::Dummy(ImVec2(0.0F, ImGui::GetTextLineHeight()));
   }
@@ -201,15 +204,15 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
         ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
     if (!controls_locked && hovered &&
         ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-      debugger_select_memory_byte(snapshot, ui, offset, ImGui::GetIO().KeyShift,
-                                  editing);
+      debugger_select_memory_byte(snapshot, ui.memory, offset,
+                                  ImGui::GetIO().KeyShift, editing);
     }
     if (!controls_locked && hovered &&
         ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-      debugger_select_memory_context(snapshot, ui, offset);
+      debugger_select_memory_context(snapshot, ui.memory, offset);
       open_byte_context = true;
     }
-    if (ui.memory_selection_dragging && ImGui::IsItemVisible()) {
+    if (ui.memory.selection_dragging && ImGui::IsItemVisible()) {
       const ImVec2 mouse = ImGui::GetIO().MousePos;
       const ImVec2 minimum = ImGui::GetItemRectMin();
       const ImVec2 maximum = ImGui::GetItemRectMax();
@@ -225,9 +228,9 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
     }
   };
   const auto byte_selected = [&](std::size_t offset) {
-    return debugger_memory_has_selection(snapshot, ui) &&
-           offset >= debugger_memory_selection_start(ui) &&
-           offset <= debugger_memory_selection_end(ui);
+    return debugger_memory_has_selection(snapshot, ui.memory) &&
+           offset >= debugger_memory_selection_start(ui.memory) &&
+           offset <= debugger_memory_selection_end(ui.memory);
   };
   const auto draw_byte = [&](std::size_t offset, const char *text,
                              ImVec2 size) {
@@ -302,7 +305,7 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
         draw_breakpoint_context_actions(snapshot, engine, ui, row_address);
         ImGui::Separator();
         if (ImGui::MenuItem(l10n::label(l10n::Key::GuiPanelsUseDumpAddress))) {
-          follow_memory(engine, ui, row_address);
+          follow_memory(engine, ui.memory, row_address);
         }
         if (ImGui::MenuItem(l10n::label(l10n::Key::GuiPanelsShowMemoryMap))) {
           show_in_memory_map(ui, row_address);
@@ -326,25 +329,25 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
                                 ImVec4(1.0F, 0.68F, 0.20F, 1.0F));
         }
         ImGui::PushID(static_cast<int>(index));
-        if (ui.memory_edit_mode && byte_offset < editable_count) {
+        if (ui.memory.edit_mode && byte_offset < editable_count) {
           if (byte_selected(byte_offset)) {
             ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg,
                                    ImGui::GetColorU32(ImGuiCol_TextSelectedBg));
           }
-          if (ui.memory_edit_focus == byte_offset) {
+          if (ui.memory.edit_focus == byte_offset) {
             ImGui::SetKeyboardFocusHere();
-            ui.memory_edit_focus.reset();
+            ui.memory.edit_focus.reset();
           }
           ImGui::SetNextItemWidth(byte_editor_width);
           const bool byte_submitted = ImGui::InputText(
-              "##byte", ui.memory_edit_bytes[byte_offset].data(),
-              ui.memory_edit_bytes[byte_offset].size(),
+              "##byte", ui.memory.edit_bytes[byte_offset].data(),
+              ui.memory.edit_bytes[byte_offset].size(),
               ImGuiInputTextFlags_CharsHexadecimal |
                   ImGuiInputTextFlags_AutoSelectAll |
                   ImGuiInputTextFlags_EnterReturnsTrue);
           interact_with_byte(byte_offset, true);
           if (byte_submitted || ImGui::IsItemDeactivatedAfterEdit()) {
-            debugger_patch_memory_byte(snapshot, engine, ui, byte_offset,
+            debugger_patch_memory_byte(snapshot, engine, ui.memory, byte_offset,
                                        byte_address);
           }
         } else {
@@ -358,9 +361,9 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
         if (can_edit && byte_offset < editable_count &&
             ImGui::IsItemHovered() &&
             ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-          ui.memory_edit_mode = true;
-          ui.memory_edit_focus = byte_offset;
-          ui.memory_selection_dragging = false;
+          ui.memory.edit_mode = true;
+          ui.memory.edit_focus = byte_offset;
+          ui.memory.selection_dragging = false;
         }
         if (patched) {
           ImGui::PopStyleColor();
@@ -392,9 +395,9 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
     memory_focused =
         memory_focused ||
         ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
-    if (ui.memory_selection_dragging && memory_editor_hovered) {
+    if (ui.memory.selection_dragging && memory_editor_hovered) {
       if (drag_offset) {
-        ui.memory_selection_end = *drag_offset;
+        ui.memory.selection_end = *drag_offset;
       }
       if (!selection_released) {
         const ImRect visible = ImGui::GetCurrentWindow()->InnerClipRect;
@@ -411,17 +414,17 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
     ImGui::EndTable();
   }
   if (selection_released) {
-    ui.memory_selection_dragging = false;
+    ui.memory.selection_dragging = false;
   }
   ImGui::PopStyleVar(2);
-  if (memory_focused && !controls_locked && !ui.keybinding_capture &&
+  if (memory_focused && !controls_locked && !ui.workspace.keybinding_capture &&
       !ImGui::GetIO().WantTextInput && ImGui::GetActiveID() == 0 &&
       !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
                                        ImGuiPopupFlags_AnyPopupLevel) &&
       ImGui::GetIO().KeyCtrl) {
     if (ImGui::IsKeyPressed(ImGuiKey_A) && !snapshot.memory.empty()) {
-      ui.memory_selection_anchor = 0;
-      ui.memory_selection_end = snapshot.memory.size() - 1;
+      ui.memory.selection_anchor = 0;
+      ui.memory.selection_end = snapshot.memory.size() - 1;
     }
     if (ImGui::IsKeyPressed(ImGuiKey_C)) {
       copy_bytes(MemoryCopyFormat::Hex, MemoryByteOrder::AsStored, 1);
@@ -431,14 +434,16 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
     ImGui::OpenPopup("memory-selection-context");
   }
   if (ImGui::BeginPopup("memory-selection-context")) {
-    if (!debugger_memory_has_selection(snapshot, ui) || dump_changed) {
+    if (!debugger_memory_has_selection(snapshot, ui.memory) || dump_changed) {
       ImGui::CloseCurrentPopup();
     } else {
-      const std::size_t first = debugger_memory_selection_start(ui);
-      const std::size_t count = debugger_memory_selection_end(ui) - first + 1;
+      const std::size_t first = debugger_memory_selection_start(ui.memory);
+      const std::size_t count =
+          debugger_memory_selection_end(ui.memory) - first + 1;
       ImGui::Text(l10n::text(l10n::Key::GuiPanelsMemorySelection),
                   snapshot.memory_base + first,
-                  snapshot.memory_base + debugger_memory_selection_end(ui),
+                  snapshot.memory_base +
+                      debugger_memory_selection_end(ui.memory),
                   count);
       const auto [pointer_width, full_pointer, known_byte_order, pointer] =
           debugger_memory_pointer(snapshot, first);
@@ -452,8 +457,8 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
       }
       if (ImGui::MenuItem(l10n::label(l10n::Key::GuiPanelsSelectPointer),
                           nullptr, false, full_pointer)) {
-        ui.memory_selection_anchor = first;
-        ui.memory_selection_end = first + pointer_width - 1;
+        ui.memory.selection_anchor = first;
+        ui.memory.selection_end = first + pointer_width - 1;
       }
       const bool pointer_navigable =
           pointer && navigable_address(snapshot, *pointer);
@@ -479,7 +484,7 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
       }
       if (ImGui::MenuItem(
               l10n::label(l10n::Key::GuiPanelsFollowPointerMemory))) {
-        follow_memory(engine, ui, *pointer);
+        follow_memory(engine, ui.memory, *pointer);
         ImGui::SetWindowCollapsed(l10n::label(l10n::Key::WindowMemoryDump),
                                   false);
         ImGui::SetWindowFocus(l10n::label(l10n::Key::WindowMemoryDump));
@@ -498,8 +503,8 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
         ImGui::TextUnformatted(l10n::text(l10n::Key::GuiPanelsMemoryCopyOrder));
         const auto order_option = [&](l10n::Key label, MemoryByteOrder order) {
           if (ImGui::RadioButton(l10n::label(label),
-                                 ui.memory_copy_order == order)) {
-            ui.memory_copy_order = order;
+                                 ui.memory.copy_order == order)) {
+            ui.memory.copy_order = order;
           }
         };
         order_option(l10n::Key::GuiPanelsMemoryAsStored,
@@ -510,11 +515,11 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
                      MemoryByteOrder::BigEndian);
         ImGui::Separator();
         ImGui::TextUnformatted(l10n::text(l10n::Key::GuiPanelsMemoryWordSize));
-        ImGui::BeginDisabled(ui.memory_copy_order == MemoryByteOrder::AsStored);
+        ImGui::BeginDisabled(ui.memory.copy_order == MemoryByteOrder::AsStored);
         const auto word_option = [&](l10n::Key label, std::size_t width) {
           if (ImGui::RadioButton(l10n::label(label),
-                                 ui.memory_copy_word_size == width)) {
-            ui.memory_copy_word_size = width;
+                                 ui.memory.copy_word_size == width)) {
+            ui.memory.copy_word_size = width;
           }
         };
         word_option(l10n::Key::GuiPanelsMemoryWord16, 2);
@@ -528,7 +533,7 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
         ImGui::TextUnformatted(
             l10n::text(l10n::Key::GuiPanelsMemoryCopyOrderHelp));
         const bool can_copy = can_format_memory_bytes(
-            count, ui.memory_copy_order, ui.memory_copy_word_size,
+            count, ui.memory.copy_order, ui.memory.copy_word_size,
             snapshot.byte_order);
         if (!can_copy) {
           ImGui::TextDisabled(
@@ -542,7 +547,7 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
         ImGui::BeginDisabled(!can_copy);
         const auto copy_option = [&](l10n::Key label, MemoryCopyFormat format) {
           if (ImGui::MenuItem(l10n::label(label))) {
-            copy_bytes(format, ui.memory_copy_order, ui.memory_copy_word_size);
+            copy_bytes(format, ui.memory.copy_order, ui.memory.copy_word_size);
           }
         };
         copy_option(l10n::Key::GuiPanelsMemoryHex, MemoryCopyFormat::Hex);
@@ -561,7 +566,7 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
       const auto integer_option = [&](l10n::Key label, MemoryByteOrder order) {
         if (ImGui::MenuItem(l10n::label(label), nullptr, false, count <= 8)) {
           if (const auto text = format_memory_integer(
-                  debugger_memory_selected_bytes(snapshot, ui), order)) {
+                  debugger_memory_selected_bytes(snapshot, ui.memory), order)) {
             ImGui::SetClipboardText(text->c_str());
           }
         }
@@ -585,8 +590,8 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
       edit_mode_at_frame_start &&
       ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !memory_editor_hovered;
   if (cancel_edit_with_escape || cancel_edit_with_outside_click) {
-    ui.memory_edit_mode = false;
-    ui.memory_edit_focus.reset();
+    ui.memory.edit_mode = false;
+    ui.memory.edit_focus.reset();
   }
   if (ImGui::BeginPopupContextWindow("memory-window-context",
                                      ImGuiPopupFlags_NoOpenOverItems)) {

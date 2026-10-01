@@ -1,15 +1,13 @@
+#include "backend/lldb/LldbEngine.h"
+#include "backend/conditions/BreakpointCondition.h"
 #include "backend/lldb/LldbEngineInternal.h"
+#include "backend/lldb/LldbInstructionCapture.h"
+#include "backend/lldb/LldbNativeCommands.h"
+#include "backend/lldb/LldbRemoteArchitecture.h"
 #include "backend/lldb/LldbSessions.h"
+#include "backend/lldb/QemuProcess.h"
 #include "localization/Localization.h"
-
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <spawn.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-extern char **environ;
+#include "plugins/PluginApi.h"
 
 namespace debugger {
 
@@ -18,176 +16,9 @@ using namespace std::chrono_literals;
 
 namespace {
 
-// Spawns an engine-owned qemu-user gdbstub: `qemu -g port [-L sysroot]
-// target args`. Returns the child pid and a pipe the engine owns for the
-// target's stdin (write end only; the read end is the child's fd 0, or the
-// child reads `stdin_file` directly). POSIX spawn keeps the fork out of the
-// worker thread's signal state.
-struct QemuStubChild {
-  pid_t pid{-1};
-  int stdin_fd{-1};
-  int stdout_fd{-1};
-};
-
-std::optional<QemuStubChild> spawn_qemu_stub(
-    const std::string &qemu_executable, const std::string &sysroot,
-    const std::string &target, const std::vector<std::string> &arguments,
-    const std::string &working_directory, const std::string &stdin_file,
-    std::uint16_t port, std::string &failure) {
-  int stdin_pipe[2] = {-1, -1};
-  int stdout_pipe[2] = {-1, -1};
-  int stdin_file_fd = -1;
-  if (stdin_file.empty() && pipe(stdin_pipe) != 0) {
-    failure = "stdin pipe failed";
-    return std::nullopt;
-  }
-  if (pipe(stdout_pipe) != 0) {
-    failure = "stdout pipe failed";
-    if (stdin_pipe[0] >= 0) {
-      close(stdin_pipe[0]);
-      close(stdin_pipe[1]);
-    }
-    return std::nullopt;
-  }
-
-  std::vector<std::string> storage;
-  // Reserve before taking .data() pointers: growth would dangle the argv
-  // entries (this once turned -L into garbage bytes).
-  storage.reserve(4 + arguments.size());
-  std::vector<char *> argv;
-  argv.push_back(const_cast<char *>(qemu_executable.c_str()));
-  if (!sysroot.empty()) {
-    storage.push_back("-L");
-    argv.push_back(storage.back().data());
-    storage.push_back(sysroot);
-    argv.push_back(storage.back().data());
-  }
-  storage.push_back("-g");
-  argv.push_back(storage.back().data());
-  storage.push_back(std::to_string(port));
-  argv.push_back(storage.back().data());
-  argv.push_back(const_cast<char *>(target.c_str()));
-  for (const std::string &argument : arguments) {
-    argv.push_back(const_cast<char *>(argument.c_str()));
-  }
-  argv.push_back(nullptr);
-
-  posix_spawn_file_actions_t actions;
-  posix_spawn_file_actions_init(&actions);
-  if (!stdin_file.empty()) {
-    stdin_file_fd = open(stdin_file.c_str(), O_RDONLY);
-    if (stdin_file_fd < 0) {
-      failure = "cannot open " + stdin_file;
-      close(stdin_pipe[0]);
-      close(stdin_pipe[1]);
-      close(stdout_pipe[0]);
-      close(stdout_pipe[1]);
-      return std::nullopt;
-    }
-    posix_spawn_file_actions_adddup2(&actions, stdin_file_fd, STDIN_FILENO);
-    posix_spawn_file_actions_addclose(&actions, stdin_file_fd);
-  } else {
-    posix_spawn_file_actions_adddup2(&actions, stdin_pipe[0], STDIN_FILENO);
-  }
-  posix_spawn_file_actions_adddup2(&actions, stdout_pipe[1], STDOUT_FILENO);
-  posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/tmp/mydbg-qemu.log",
-                                   O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (!working_directory.empty()) {
-    posix_spawn_file_actions_addchdir_np(&actions, working_directory.c_str());
-  }
-
-  pid_t pid = -1;
-  // Minimal environment: an inherited nix-shell LD_LIBRARY_PATH breaks
-  // qemu's interpreter mapping ("File exists").
-  std::string path_storage = "PATH=" + std::string(
-      getenv("PATH") ? getenv("PATH") : "/usr/bin:/bin");
-  std::string home_storage = "HOME=" + std::string(
-      getenv("HOME") ? getenv("HOME") : "/root");
-  std::string lang_storage = "LANG=C";
-  char *environment[] = {path_storage.data(), home_storage.data(),
-                         lang_storage.data(), nullptr};
-  const int spawn_error =
-      posix_spawnp(&pid, argv[0], &actions, nullptr, argv.data(),
-                   environment);
-  posix_spawn_file_actions_destroy(&actions);
-  close(stdout_pipe[1]);
-  if (stdin_pipe[0] >= 0) {
-    close(stdin_pipe[0]);
-  }
-  if (stdin_file_fd >= 0) {
-    close(stdin_file_fd);
-  }
-  if (spawn_error != 0 || pid <= 0) {
-    failure = "posix_spawnp failed: " + std::string(strerror(spawn_error));
-    close(stdout_pipe[0]);
-    if (stdin_pipe[1] >= 0) {
-      close(stdin_pipe[1]);
-    }
-    return std::nullopt;
-  }
-  // The target's stdout flows through the owned pipe: the run loop drains it
-  // into the session's output chunks.
-  fcntl(stdout_pipe[0], F_SETFL, fcntl(stdout_pipe[0], F_GETFL) | O_NONBLOCK);
-  return QemuStubChild{pid, stdin_file.empty() ? stdin_pipe[1] : -1,
-                       stdout_pipe[0]};
-}
-
-// A bindable loopback port for the gdbstub; the brief bind/close race is
-// acceptable because qemu exits with a diagnostic the connect flow reports.
-std::optional<std::uint16_t> pick_stub_port(std::string &failure) {
-  int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (socket_fd < 0) {
-    failure = "socket failed";
-    return std::nullopt;
-  }
-  sockaddr_in address{};
-  address.sin_family = AF_INET;
-  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  for (int attempt = 0; attempt < 64; ++attempt) {
-    address.sin_port = htons(static_cast<std::uint16_t>(
-        26000 + ((rand() ^ static_cast<int>(getpid())) % 20000)));
-    if (bind(socket_fd, reinterpret_cast<sockaddr *>(&address),
-             sizeof(address)) == 0) {
-      const std::uint16_t port = ntohs(address.sin_port);
-      close(socket_fd);
-      return port;
-    }
-  }
-  close(socket_fd);
-  failure = "no free loopback port";
-  return std::nullopt;
-}
-
-// Waits until qemu's gdbstub port is claimed. /proc/net/tcp misses qemu's
-// listener entirely, so claim detection uses a bind probe (EADDRINUSE), the
-// same approach the test harness uses.
-bool wait_stub_listen(std::uint16_t port) {
-  for (int attempt = 0; attempt < 250; ++attempt) {
-    const int probe = socket(AF_INET, SOCK_STREAM, 0);
-    if (probe >= 0) {
-      sockaddr_in address{};
-      address.sin_family = AF_INET;
-      address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-      address.sin_port = htons(port);
-      const int bind_result =
-          bind(probe, reinterpret_cast<sockaddr *>(&address), sizeof(address));
-      close(probe);
-      if (bind_result < 0 && errno == EADDRINUSE) {
-        return true;
-      }
-      if (bind_result == 0) {
-        // We briefly own the port; drop it and let qemu retry consumers.
-      }
-    }
-    usleep(20 * 1000);
-  }
-  return false;
-}
-
 struct LldbRuntime {
   LldbRuntime()
-      : initialization_error{
-            lldb::SBDebugger::InitializeWithErrorHandling()} {}
+      : initialization_error{lldb::SBDebugger::InitializeWithErrorHandling()} {}
 
   ~LldbRuntime() { lldb::SBDebugger::Terminate(); }
 
@@ -591,6 +422,7 @@ void LldbEngine::request_shutdown() {
 
 void LldbEngine::run() {
   SessionSnapshot state;
+  QemuProcess qemu{state, qemu_pid_, qemu_stdin_fd_, qemu_stdout_fd_};
   lldb::SBTarget target;
   LldbSessions session{sessions_};
   std::optional<lldb::addr_t> instruction_view_address;
@@ -695,15 +527,14 @@ void LldbEngine::run() {
       "regs", "disasm", "insight", "stack", "backtrace", "threads", "crash"};
   std::vector<WatchSpec> watch_specs;
   std::vector<std::pair<std::string, std::uint64_t>> custom_symbols;
-  std::uint32_t next_patch_id = 1;
+  PatchCommands patch_commands;
   struct ScriptConditionState {
     std::string source;
     conditions::CompiledCondition compiled;
     std::string last_error;
   };
   std::unordered_map<std::uint32_t, ScriptConditionState> script_conditions;
-  std::unordered_map<std::uint32_t, std::uint32_t>
-      frameless_breakpoint_hits;
+  std::unordered_map<std::uint32_t, std::uint32_t> frameless_breakpoint_hits;
   std::uint64_t counted_frameless_stop_revision = 0;
   auto refresh_breakpoint_state = [&] {
     refresh_breakpoints(target, state);
@@ -863,7 +694,8 @@ void LldbEngine::run() {
       persistent_symbols = std::move(saved->symbols);
       for (auto &expression : saved->watches) {
         watch_specs.push_back(WatchSpec{false, expression});
-        state.watches.push_back(WatchInfo{.expression = std::move(expression)});
+        state.watches.push_back(WatchInfo{
+            .expression = std::move(expression), .value = {}, .error = {}});
       }
       apply_launch_intent();
       restore_pending_session();
@@ -928,47 +760,8 @@ void LldbEngine::run() {
     reset_value_scan_state();
     reset_binary_string_state();
   };
-  auto stop_qemu_child = [&] {
-    // Drain any buffered target output first: killing qemu would lose it.
-    if (qemu_stdout_fd_ >= 0) {
-      char buffer[8192];
-      for (;;) {
-        const ssize_t count = read(qemu_stdout_fd_, buffer, sizeof(buffer));
-        if (count <= 0) {
-          break;
-        }
-        lldb_detail::append_output_chunk(
-            state, std::string_view{buffer, static_cast<std::size_t>(count)});
-      }
-      close(qemu_stdout_fd_);
-      qemu_stdout_fd_ = -1;
-    }
-    if (qemu_pid_ > 0) {
-      kill(qemu_pid_, SIGKILL);
-      waitpid(qemu_pid_, nullptr, WNOHANG);
-      qemu_pid_ = -1;
-    }
-    if (qemu_stdin_fd_ >= 0) {
-      close(qemu_stdin_fd_);
-      qemu_stdin_fd_ = -1;
-    }
-  };
-  auto drain_qemu_stdout = [&] {
-    if (qemu_stdout_fd_ < 0) {
-      return;
-    }
-    char buffer[8192];
-    for (;;) {
-      const ssize_t count = read(qemu_stdout_fd_, buffer, sizeof(buffer));
-      if (count <= 0) {
-        return;
-      }
-      lldb_detail::append_output_chunk(
-          state, std::string_view{buffer, static_cast<std::size_t>(count)});
-    }
-  };
   auto replace_target = [&] {
-    stop_qemu_child();
+    qemu.stop();
     reset_target_session();
     if (process.IsValid() && should_destroy(process.GetState())) {
       process.Destroy();
@@ -1006,8 +799,7 @@ void LldbEngine::run() {
     active_process_id = process.GetUniqueID();
     active_process_generation = state.generation;
     state.process_id = process.GetProcessID();
-    state.process_is_remote =
-        remote_hint.value_or(process_is_remote(process));
+    state.process_is_remote = remote_hint.value_or(process_is_remote(process));
     if (state.process_is_remote && state.mode == SessionMode::Local) {
       state.mode = SessionMode::Remote;
     } else if (!state.process_is_remote) {
@@ -1015,15 +807,15 @@ void LldbEngine::run() {
     }
   };
   auto connect_remote_process = [&](const std::string &endpoint,
-                                     lldb::SBError &error) {
+                                    lldb::SBError &error) {
     lldb::SBProcess connected;
     {
       const std::lock_guard lock{worker_control_->mutex};
       worker_control_->remote_connection_active = true;
     }
     if (!shutdown_requested_.load()) {
-      connected = target.ConnectRemote(listener, endpoint.c_str(),
-                                       "gdb-remote", error);
+      connected =
+          target.ConnectRemote(listener, endpoint.c_str(), "gdb-remote", error);
     }
     {
       const std::lock_guard lock{worker_control_->mutex};
@@ -1315,22 +1107,15 @@ void LldbEngine::run() {
 
   bool native_response_failed = false;
   bool external_console_response = false;
-  auto error_response = [&](const char *message) {
-    native_response_failed = true;
-    return message;
-  };
-  auto error_detail = [&](const std::string &message) {
-    native_response_failed = true;
-    return l10n::format(l10n::Key::EngineErrorDetail, message.c_str());
-  };
+  NativeCommandStatus command_status{native_response_failed};
 
   auto set_breakpoint_impl = [&](std::string_view specification,
                                  std::string_view script = {}) {
     specification = trim(specification);
     if (!target.IsValid()) {
       state.error = l10n::text(l10n::Key::EngineNoTargetIsLoaded);
-      return std::string{
-          error_response(l10n::text(l10n::Key::EngineErrorNoTargetIsLoaded))};
+      return std::string{command_status.error_response(
+          l10n::text(l10n::Key::EngineErrorNoTargetIsLoaded))};
     }
     if (specification.empty()) {
       state.error =
@@ -1344,7 +1129,7 @@ void LldbEngine::run() {
       conditions::CompileResult compiled = conditions::compile(script);
       if (!compiled) {
         state.error = compiled.error;
-        return error_detail(state.error);
+        return command_status.error_detail(state.error);
       }
       compiled_script = std::move(compiled.condition);
     }
@@ -1355,7 +1140,7 @@ void LldbEngine::run() {
       address = resolve_address(specification.substr(1), process, failure);
       if (!address) {
         state.error = failure;
-        return error_detail(failure);
+        return command_status.error_detail(failure);
       }
     }
     if (!address && process.IsValid() &&
@@ -1415,7 +1200,7 @@ void LldbEngine::run() {
     }
     if (!breakpoint.IsValid()) {
       state.error = l10n::text(l10n::Key::EngineLLDBRejectedTheBreakpoint);
-      return std::string{error_response(
+      return std::string{command_status.error_response(
           l10n::text(l10n::Key::EngineErrorLLDBRejectedTheBreakpoint))};
     }
 
@@ -1444,7 +1229,7 @@ void LldbEngine::run() {
     if (!target.IsValid() ||
         !target.BreakpointDelete(static_cast<lldb::break_id_t>(id))) {
       state.error = l10n::format(l10n::Key::EngineBreakpointNotFound, id);
-      return error_detail(state.error);
+      return command_status.error_detail(state.error);
     }
     script_conditions.erase(id);
     refresh_breakpoint_state();
@@ -1459,7 +1244,7 @@ void LldbEngine::run() {
             : lldb::SBBreakpoint{};
     if (!breakpoint.IsValid()) {
       state.error = l10n::format(l10n::Key::EngineBreakpointNotFound, id);
-      return error_detail(state.error);
+      return command_status.error_detail(state.error);
     }
     breakpoint.SetEnabled(enabled);
     refresh_breakpoint_state();
@@ -1476,7 +1261,7 @@ void LldbEngine::run() {
             : lldb::SBBreakpoint{};
     if (!breakpoint.IsValid()) {
       state.error = l10n::format(l10n::Key::EngineBreakpointNotFound, id);
-      return error_detail(state.error);
+      return command_status.error_detail(state.error);
     }
     source = trim(source);
     if (source.empty()) {
@@ -1488,7 +1273,7 @@ void LldbEngine::run() {
     conditions::CompileResult compiled = conditions::compile(source);
     if (!compiled) {
       state.error = compiled.error;
-      return error_detail(state.error);
+      return command_status.error_detail(state.error);
     }
     script_conditions.insert_or_assign(
         id, ScriptConditionState{.source = std::string{source},
@@ -1586,98 +1371,25 @@ void LldbEngine::run() {
     return saw_scripted_breakpoint;
   };
 
-  auto step_frameless_mips = [&](std::string &failure) {
-    std::vector<lldb::SBBreakpoint> disabled;
-    for (const BreakpointInfo &breakpoint : state.breakpoints) {
-      if (!breakpoint.enabled ||
-          std::ranges::find(breakpoint.addresses, state.pc) ==
-              breakpoint.addresses.end()) {
-        continue;
-      }
-      lldb::SBBreakpoint native = target.FindBreakpointByID(breakpoint.id);
-      if (native.IsValid()) {
-        native.SetEnabled(false);
-        disabled.push_back(native);
-      }
-    }
-
-    const bool stepped = step_frameless_qemu_mips(target, failure);
-    for (lldb::SBBreakpoint &breakpoint : disabled) {
-      breakpoint.SetEnabled(true);
-    }
-    return stepped;
-  };
-
-  auto continue_impl = [&] {
-    if (state.state != SessionState::Stopped || !process.IsValid()) {
-      state.error = l10n::text(
-          l10n::Key::EngineContinueIsOnlyValidWhileTheProcessIsStopped);
-      return error_detail(state.error);
-    }
-
-    if (is_frameless_qemu_mips_stop(process, state)) {
-      const bool at_breakpoint =
-          std::ranges::any_of(state.breakpoints,
-                              [&state](const BreakpointInfo &breakpoint) {
-                                return breakpoint.enabled &&
-                                       std::ranges::find(
-                                           breakpoint.addresses, state.pc) !=
-                                           breakpoint.addresses.end();
-                              });
-      if (at_breakpoint) {
-        std::string failure;
-        if (!step_frameless_mips(failure)) {
-          state.error = std::move(failure);
-          return error_detail(state.error);
-        }
-      }
-    }
-
-    lldb::SBError continue_error = process.Continue();
-    if (continue_error.Fail()) {
-      state.error = error_text(continue_error);
-      return error_detail(state.error);
-    }
-    state.state = SessionState::Running;
-    state.crash = {};
-    state.error.clear();
-    return std::string{l10n::text(l10n::Key::EngineRunning)};
-  };
-
-  auto stop_impl = [&] {
-    if (state.state != SessionState::Running || !process.IsValid()) {
-      state.error =
-          l10n::text(l10n::Key::EnginePauseIsOnlyValidWhileTheProcessIsRunning);
-      return error_detail(state.error);
-    }
-    lldb::SBError stop_error = process.Stop();
-    if (stop_error.Fail()) {
-      state.error = error_text(stop_error);
-      return error_detail(state.error);
-    }
-    state.error.clear();
-    return std::string{l10n::text(l10n::Key::EnginePauseRequested)};
-  };
-
   auto step_instruction_impl = [&](bool step_over) {
     if (state.state != SessionState::Stopped || !process.IsValid()) {
       state.error =
           l10n::text(l10n::Key::EngineSteppingRequiresAStoppedProcess);
-      return error_detail(state.error);
+      return command_status.error_detail(state.error);
     }
     if (is_frameless_qemu_mips_stop(process, state)) {
       if (step_over) {
         state.error = l10n::text(
             l10n::Key::
                 EngineInstructionStepOverIsUnavailableForThisRemoteTarget);
-        return error_detail(state.error);
+        return command_status.error_detail(state.error);
       }
       const std::uint64_t previous_pc = state.pc;
       const std::uint64_t previous_stop_revision = state.stop_revision;
       std::string failure;
-      if (!step_frameless_mips(failure)) {
+      if (!step_frameless_qemu_mips_at_breakpoint(target, state, failure)) {
         state.error = std::move(failure);
-        return error_detail(state.error);
+        return command_status.error_detail(state.error);
       }
       instruction_view_address.reset();
       capture_stop(target, process, memory_view_address,
@@ -1695,13 +1407,13 @@ void LldbEngine::run() {
     lldb::SBThread thread = process.GetSelectedThread();
     if (!thread.IsValid()) {
       state.error = l10n::text(l10n::Key::EngineNoSelectedThread);
-      return error_detail(state.error);
+      return command_status.error_detail(state.error);
     }
     lldb::SBError step_error;
     thread.StepInstruction(step_over, step_error);
     if (step_error.Fail()) {
       state.error = error_text(step_error);
-      return error_detail(state.error);
+      return command_status.error_detail(state.error);
     }
     state.state = SessionState::Running;
     state.crash = {};
@@ -1710,54 +1422,16 @@ void LldbEngine::run() {
                      : std::string{l10n::text(l10n::Key::EngineSteppingInto)};
   };
 
-  auto run_to_address_impl = [&](lldb::addr_t address) {
-    if (state.state != SessionState::Stopped || !process.IsValid()) {
-      state.error =
-          l10n::text(l10n::Key::EngineRunToCursorRequiresAStoppedProcess);
-      return error_detail(state.error);
-    }
-    lldb::SBThread thread = process.GetSelectedThread();
-    if (!thread.IsValid()) {
-      state.error = l10n::text(l10n::Key::EngineNoSelectedThread);
-      return error_detail(state.error);
-    }
-    lldb::SBError run_error;
-    thread.RunToAddress(address, run_error);
-    if (run_error.Fail()) {
-      state.error = error_text(run_error);
-      return error_detail(state.error);
-    }
-    state.state = SessionState::Running;
-    state.crash = {};
-    state.error.clear();
-    return l10n::format(l10n::Key::EngineRunningToAddress,
-                        static_cast<std::uint64_t>(address));
-  };
-
-  auto terminate_impl = [&] {
-    if (!process.IsValid() || state.state == SessionState::Exited) {
-      state.error = l10n::text(l10n::Key::EngineNoLiveProcessToTerminate);
-      return error_detail(state.error);
-    }
-    lldb::SBError kill_error = process.Kill();
-    if (kill_error.Fail()) {
-      state.error = error_text(kill_error);
-      return error_detail(state.error);
-    }
-    state.error.clear();
-    return std::string{l10n::text(l10n::Key::EngineProcessTerminated)};
-  };
-
   auto dump_memory_impl = [&](lldb::addr_t address) {
     if (state.state != SessionState::Stopped || !process.IsValid()) {
       state.error = l10n::text(
           l10n::Key::EngineMemoryCanOnlyBeReadWhileTheProcessIsStopped);
-      return error_detail(state.error);
+      return command_status.error_detail(state.error);
     }
     memory_view_address = address;
     capture_memory(process, address, state);
     if (!state.error.empty()) {
-      return error_detail(state.error);
+      return command_status.error_detail(state.error);
     }
     return l10n::format(l10n::Key::EngineDumpingMemory, state.memory.size(),
                         static_cast<std::uint64_t>(address));
@@ -1828,103 +1502,100 @@ void LldbEngine::run() {
     return output;
   };
 
-  auto synchronize_after_lldb_command =
-      [&](std::optional<bool> remote_hint = std::nullopt,
-          bool local_target_hint = false) {
-        synchronized_command_revision = native_command_revision;
-        lldb::SBTarget selected_target = debugger.GetSelectedTarget();
-        lldb::SBProcess selected_process =
-            selected_target.IsValid() ? selected_target.GetProcess()
-                                      : lldb::SBProcess{};
-        const bool target_changed =
-            selected_target.IsValid() != target.IsValid() ||
-            (selected_target.IsValid() && selected_target != target);
-        const bool process_changed =
-            selected_process.IsValid() &&
-            (target_changed ||
-             active_process_generation != state.generation ||
-             selected_process.GetUniqueID() != active_process_id);
-        if (target_changed || process_changed) {
-          begin_generation();
-        }
+  auto synchronize_after_lldb_command = [&](std::optional<bool> remote_hint =
+                                                std::nullopt,
+                                            bool local_target_hint = false) {
+    synchronized_command_revision = native_command_revision;
+    lldb::SBTarget selected_target = debugger.GetSelectedTarget();
+    lldb::SBProcess selected_process = selected_target.IsValid()
+                                           ? selected_target.GetProcess()
+                                           : lldb::SBProcess{};
+    const bool target_changed =
+        selected_target.IsValid() != target.IsValid() ||
+        (selected_target.IsValid() && selected_target != target);
+    const bool process_changed =
+        selected_process.IsValid() &&
+        (target_changed || active_process_generation != state.generation ||
+         selected_process.GetUniqueID() != active_process_id);
+    if (target_changed || process_changed) {
+      begin_generation();
+    }
 
-        if (target_changed) {
-          reset_target_session();
-          target = selected_target;
-          state.target_path.clear();
-          state.local_symbol_path.clear();
-          state.security = {};
-          state.breakpoints.clear();
-          script_conditions.clear();
-        } else if (selected_target.IsValid()) {
-          target = selected_target;
-        }
+    if (target_changed) {
+      reset_target_session();
+      target = selected_target;
+      state.target_path.clear();
+      state.local_symbol_path.clear();
+      state.security = {};
+      state.breakpoints.clear();
+      script_conditions.clear();
+    } else if (selected_target.IsValid()) {
+      target = selected_target;
+    }
 
-        if (selected_process.IsValid()) {
-          adopt_process(
-              selected_process,
-              process_changed ? remote_hint
-                              : std::optional<bool>{state.process_is_remote});
-        } else if (target_changed || !target.IsValid()) {
-          adopt_process(lldb::SBProcess{});
-        }
+    if (selected_process.IsValid()) {
+      adopt_process(selected_process,
+                    process_changed
+                        ? remote_hint
+                        : std::optional<bool>{state.process_is_remote});
+    } else if (target_changed || !target.IsValid()) {
+      adopt_process(lldb::SBProcess{});
+    }
 
-        if (target.IsValid()) {
-          std::array<char, 4096> path{};
-          target.GetExecutable().GetPath(path.data(), path.size());
-          const std::string selected_path = safe_string(path.data());
-          if (!selected_path.empty() &&
-              (state.mode == SessionMode::Local ||
-               state.target_path.empty())) {
-            // Local sessions always follow the launched binary; remote
-            // sessions (gdbserver, qemu-user) report the stub's own
-            // executable (qemu), which is not the image under analysis.
-            state.target_path = selected_path;
-            if (local_target_hint ||
-                (!state.process_is_remote &&
-                 state.local_symbol_path.empty() && process.IsValid())) {
-              state.local_symbol_path = selected_path;
-            }
-          }
-          state.security =
-              state.local_symbol_path.empty()
-                  ? ElfSecurityInfo{}
-                  : inspect_elf_security(state.local_symbol_path);
-          refresh_target_architecture();
-          capture_modules(target, state);
-          open_target_session();
-          restore_pending_session();
-        } else {
-          state.target_triple.clear();
-          state.architecture.clear();
-          state.byte_order.clear();
-          state.address_byte_size = 0;
-          state.supports_intel_syntax = false;
+    if (target.IsValid()) {
+      std::array<char, 4096> path{};
+      target.GetExecutable().GetPath(path.data(), path.size());
+      const std::string selected_path = safe_string(path.data());
+      if (!selected_path.empty() &&
+          (state.mode == SessionMode::Local || state.target_path.empty())) {
+        // Local sessions always follow the launched binary; remote
+        // sessions (gdbserver, qemu-user) report the stub's own
+        // executable (qemu), which is not the image under analysis.
+        state.target_path = selected_path;
+        if (local_target_hint ||
+            (!state.process_is_remote && state.local_symbol_path.empty() &&
+             process.IsValid())) {
+          state.local_symbol_path = selected_path;
         }
+      }
+      state.security = state.local_symbol_path.empty()
+                           ? ElfSecurityInfo{}
+                           : inspect_elf_security(state.local_symbol_path);
+      refresh_target_architecture();
+      capture_modules(target, state);
+      open_target_session();
+      restore_pending_session();
+    } else {
+      state.target_triple.clear();
+      state.architecture.clear();
+      state.byte_order.clear();
+      state.address_byte_size = 0;
+      state.supports_intel_syntax = false;
+    }
 
-        const lldb::StateType process_state =
-            process.IsValid() ? process.GetState() : lldb::eStateInvalid;
-        if (is_inspectable_stop(process_state)) {
-          instruction_view_address.reset();
-          capture_stop(target, process, memory_view_address,
-                       instruction_view_address, state);
-        } else if (process_state == lldb::eStateRunning ||
-                   process_state == lldb::eStateStepping ||
-                   process_state == lldb::eStateLaunching ||
-                   process_state == lldb::eStateAttaching ||
-                   process_state == lldb::eStateConnected) {
-          state.state = SessionState::Running;
-          state.crash = {};
-          state.error.clear();
-        } else if (process_state == lldb::eStateExited) {
-          state.state = SessionState::Exited;
-          state.exit_status = process.GetExitStatus();
-        } else if (target.IsValid()) {
-          state.state = SessionState::TargetLoaded;
-        } else {
-          state.state = SessionState::NoTarget;
-        }
-      };
+    const lldb::StateType process_state =
+        process.IsValid() ? process.GetState() : lldb::eStateInvalid;
+    if (is_inspectable_stop(process_state)) {
+      instruction_view_address.reset();
+      capture_stop(target, process, memory_view_address,
+                   instruction_view_address, state);
+    } else if (process_state == lldb::eStateRunning ||
+               process_state == lldb::eStateStepping ||
+               process_state == lldb::eStateLaunching ||
+               process_state == lldb::eStateAttaching ||
+               process_state == lldb::eStateConnected) {
+      state.state = SessionState::Running;
+      state.crash = {};
+      state.error.clear();
+    } else if (process_state == lldb::eStateExited) {
+      state.state = SessionState::Exited;
+      state.exit_status = process.GetExitStatus();
+    } else if (target.IsValid()) {
+      state.state = SessionState::TargetLoaded;
+    } else {
+      state.state = SessionState::NoTarget;
+    }
+  };
 
   auto refresh_watches = [&] {
     state.watches.clear();
@@ -1957,285 +1628,7 @@ void LldbEngine::run() {
 
   auto context_impl = [&](std::string_view requested_section) {
     refresh_watches();
-    const std::vector<std::string> sections =
-        requested_section.empty()
-            ? context_sections
-            : std::vector<std::string>{lowercase(trim(requested_section))};
-    const auto enabled = [&sections](std::string_view section) {
-      return std::find(sections.begin(), sections.end(), section) !=
-             sections.end();
-    };
-    const auto write_pointer_chain =
-        [](std::ostringstream &stream,
-           const std::vector<PointerChainEntry> &chain) {
-          for (const PointerChainEntry &entry : chain) {
-            stream << " -> ";
-            if (!entry.error.empty()) {
-              stream << '<' << entry.error << '>';
-              break;
-            }
-            stream << "0x" << std::hex << entry.value;
-            if (!entry.symbol.empty()) {
-              stream << " (" << entry.symbol << ')';
-            } else if (!entry.mapping.empty()) {
-              stream << " (" << entry.mapping << ')';
-            }
-          }
-        };
-
-    std::ostringstream output;
-    if (enabled("regs")) {
-      output << l10n::text(l10n::Key::EngineRegisters);
-      for (const RegisterValue &value : state.registers) {
-        output << value.name << '=' << value.value;
-        if (value.changed) {
-          output << l10n::format(l10n::Key::EnginePreviousRegisterValue,
-                                 value.previous_value.c_str());
-        }
-        write_pointer_chain(output, value.pointer_chain);
-        output << '\n';
-      }
-      output << '\n';
-    }
-    if (enabled("disasm")) {
-      output << l10n::text(l10n::Key::EngineDisassembly);
-      for (const InstructionRow &instruction : state.instructions) {
-        if (instruction.address + 64 < state.pc ||
-            instruction.address > state.pc + 64) {
-          continue;
-        }
-        output << (instruction.address == state.pc ? "=> " : "   ") << "0x"
-               << std::hex << instruction.address << ' ' << instruction.mnemonic
-               << ' ' << instruction.operands << '\n';
-      }
-    }
-    if (enabled("insight") || enabled("operands") || enabled("args")) {
-      output << l10n::text(l10n::Key::EngineInstructionInsight);
-      const auto current =
-          std::find_if(state.instructions.begin(), state.instructions.end(),
-                       [&state](const InstructionRow &instruction) {
-                         return instruction.address == state.pc;
-                       });
-      if (current == state.instructions.end()) {
-        output << l10n::text(
-            l10n::Key::EngineUnavailableCurrentInstructionWasNotCaptured);
-      } else {
-        for (const ResolvedOperandInfo &operand : current->resolved_operands) {
-          output << operand_role_display(operand.role) << ' '
-                 << operand.expression;
-          if (!operand.error.empty()) {
-            output << " = <" << operand.error << ">\n";
-            continue;
-          }
-          if (operand.has_value) {
-            output << " = 0x" << std::hex << operand.value;
-            write_pointer_chain(output, operand.pointer_chain);
-          }
-          output << '\n';
-        }
-        if (current->branch.conditional) {
-          output << l10n::text(l10n::Key::EngineBranch);
-          if (current->branch.available) {
-            output << (current->branch.taken
-                           ? l10n::text(l10n::Key::EngineTAKEN)
-                           : l10n::text(l10n::Key::EngineNOTTAKEN));
-          } else {
-            output << l10n::text(l10n::Key::EngineUNKNOWN);
-          }
-          output << " (" << current->branch.explanation << ") -> 0x" << std::hex
-                 << (current->branch.taken ? current->branch.taken_target
-                                           : current->branch.fallthrough_target)
-                 << '\n';
-        }
-        if (!current->arguments.empty()) {
-          output << (current->flow_kind == InstructionFlowKind::Syscall
-                         ? l10n::text(l10n::Key::EngineSyscallArguments)
-                         : l10n::text(l10n::Key::EngineCallArguments));
-          for (const AbiArgumentInfo &argument : current->arguments) {
-            output << "  " << argument.name << " = ";
-            if (!argument.error.empty()) {
-              output << '<' << argument.error << '>';
-            } else {
-              output << "0x" << std::hex << argument.value;
-              write_pointer_chain(output, argument.pointer_chain);
-            }
-            output << '\n';
-          }
-        }
-      }
-    }
-    if (enabled("stack")) {
-      output << l10n::text(l10n::Key::EngineStack);
-      for (const StackEntry &entry : state.stack) {
-        output << "0x" << std::hex << entry.address << "  0x" << entry.value;
-        if (!entry.symbol.empty()) {
-          output << "  " << entry.symbol;
-        }
-        write_pointer_chain(output, entry.pointer_chain);
-        output << '\n';
-      }
-    }
-    if (enabled("backtrace")) {
-      output << l10n::text(l10n::Key::EngineBacktrace);
-      for (const ThreadInfo &thread : state.threads) {
-        if (!thread.selected) {
-          continue;
-        }
-        for (const StackFrameInfo &frame : thread.frames) {
-          output << '#' << std::dec << frame.index << " 0x" << std::hex
-                 << frame.pc << ' ' << frame.function << '\n';
-        }
-      }
-    }
-    if (enabled("threads")) {
-      output << l10n::text(l10n::Key::EngineThreads);
-      for (const ThreadInfo &thread : state.threads) {
-        output << (thread.selected ? "* " : "  ") << std::dec << thread.index
-               << " tid=0x" << std::hex << thread.id << ' ' << thread.name
-               << ' ' << thread.stop_reason << '\n';
-      }
-    }
-    if (enabled("expressions") || enabled("watches")) {
-      output << l10n::text(l10n::Key::EngineExpressions);
-      for (const WatchInfo &watch : state.watches) {
-        output << watch.expression << " = "
-               << (watch.error.empty() ? watch.value : watch.error) << '\n';
-      }
-    }
-    if (enabled("history")) {
-      output << l10n::text(l10n::Key::EngineStopHistory);
-      for (const StopHistoryEntry &entry : state.stop_history) {
-        output << l10n::format(l10n::Key::EngineStopHistoryEntry,
-                               entry.generation, entry.stop_revision,
-                               entry.thread_id, entry.pc, entry.sp,
-                               entry.stop_reason.c_str());
-      }
-    }
-    if (enabled("crash")) {
-      output << l10n::text(l10n::Key::EngineCrash);
-      if (!state.crash.crashed) {
-        output << l10n::text(l10n::Key::EngineNotCrashed);
-      } else {
-        output << state.crash.summary << '\n'
-               << l10n::text(l10n::Key::EngineStackExecutable)
-               << (state.crash.stack_executable
-                       ? l10n::text(l10n::Key::EngineYes)
-                       : l10n::text(l10n::Key::EngineNo))
-               << '\n';
-        for (const CyclicMatch &match : state.crash.cyclic_matches) {
-          output << cyclic_source_display(match.source);
-          if (match.has_address) {
-            output << " @ 0x" << std::hex << match.address;
-          }
-          output << l10n::text(l10n::Key::EngineCyclicOffset) << std::dec
-                 << match.offset << " (" << match.bytes << ")\n";
-        }
-      }
-    }
-    if (enabled("ghidra")) {
-      output << l10n::text(l10n::Key::EngineGhidra)
-             << l10n::text(l10n::Key::EngineSeeTheSynchronizedDecompilerPanel);
-    }
-    return output.str();
-  };
-
-  auto apply_patch = [&](lldb::addr_t address,
-                         const std::vector<std::uint8_t> &replacement) {
-    if (state.state != SessionState::Stopped || !process.IsValid()) {
-      return std::string{error_response(
-          l10n::text(l10n::Key::EngineErrorPatchingRequiresAStoppedProcess))};
-    }
-    if (replacement.empty() ||
-        replacement.size() >
-            std::numeric_limits<std::uint64_t>::max() - address) {
-      return std::string{error_response(
-          l10n::text(l10n::Key::EngineErrorPatchBytesAreEmptyOrOutOfRange))};
-    }
-
-    std::uint64_t merged_start = address;
-    std::uint64_t merged_end = address + replacement.size();
-    std::vector<std::uint32_t> merged_ids;
-    bool found_overlap = true;
-    while (found_overlap) {
-      found_overlap = false;
-      for (const PatchInfo &patch : state.patches) {
-        if (std::find(merged_ids.begin(), merged_ids.end(), patch.id) !=
-            merged_ids.end()) {
-          continue;
-        }
-        const std::uint64_t patch_end =
-            patch.address + patch.replacement.size();
-        if (merged_start < patch_end && patch.address < merged_end) {
-          merged_ids.push_back(patch.id);
-          merged_start = std::min(merged_start, patch.address);
-          merged_end = std::max(merged_end, patch_end);
-          found_overlap = true;
-        }
-      }
-    }
-
-    std::string failure;
-    const std::size_t merged_size =
-        static_cast<std::size_t>(merged_end - merged_start);
-    auto current =
-        read_memory_bytes(process, merged_start, merged_size, failure);
-    if (!current) {
-      return error_detail(failure);
-    }
-    std::vector<std::uint8_t> original = *current;
-    for (const PatchInfo &patch : state.patches) {
-      if (std::find(merged_ids.begin(), merged_ids.end(), patch.id) ==
-          merged_ids.end()) {
-        continue;
-      }
-      const std::size_t offset =
-          static_cast<std::size_t>(patch.address - merged_start);
-      std::copy(patch.original.begin(), patch.original.end(),
-                original.begin() + static_cast<std::ptrdiff_t>(offset));
-    }
-    const std::size_t replacement_offset =
-        static_cast<std::size_t>(address - merged_start);
-    std::copy(replacement.begin(), replacement.end(),
-              current->begin() +
-                  static_cast<std::ptrdiff_t>(replacement_offset));
-
-    lldb::SBError write_error;
-    const std::size_t written = process.WriteMemory(
-        merged_start, current->data(), current->size(), write_error);
-    state.disassembly_graph.reset();
-    if (write_error.Fail() || written != current->size()) {
-      return error_detail(error_text(write_error));
-    }
-
-    const std::uint32_t id =
-        merged_ids.empty()
-            ? next_patch_id++
-            : *std::min_element(merged_ids.begin(), merged_ids.end());
-    std::erase_if(state.patches, [&merged_ids](const PatchInfo &patch) {
-      return std::find(merged_ids.begin(), merged_ids.end(), patch.id) !=
-             merged_ids.end();
-    });
-    const bool restored = *current == original;
-    if (!restored) {
-      state.patches.push_back(PatchInfo{
-          .id = id,
-          .address = merged_start,
-          .original = std::move(original),
-          .replacement = std::move(*current),
-      });
-    }
-    if (!state.memory.empty()) {
-      capture_memory(process, state.memory_base, state);
-    }
-    if (!state.instructions.empty()) {
-      capture_instructions(target, state.instructions.front().address, state);
-    }
-
-    if (restored) {
-      return l10n::format(l10n::Key::EnginePatchRestored, id);
-    }
-    return l10n::format(l10n::Key::EnginePatchWritten, id, replacement.size(),
-                        static_cast<std::uint64_t>(address));
+    return render_console_context(state, context_sections, requested_section);
   };
 
   auto execute_prompt = [&](const std::string &command_line) -> std::string {
@@ -2250,8 +1643,24 @@ void LldbEngine::run() {
                                            ? std::string_view{}
                                            : trim(text.substr(separator + 1));
     std::string response;
+    std::optional<std::string> handled;
 
-    if (command == "help" || command == "h") {
+    if ((handled = patch_commands.execute(command, arguments, target, process,
+                                          state, native_response_failed))) {
+      response = std::move(*handled);
+    } else if ((handled = execute_inspection_command(command, arguments, target,
+                                                     process, state,
+                                                     native_response_failed))) {
+      response = std::move(*handled);
+    } else if ((handled =
+                    execute_heap_command(command, arguments, target, process,
+                                         state, native_response_failed))) {
+      response = std::move(*handled);
+    } else if ((handled =
+                    execute_flow_command(command, arguments, target, process,
+                                         state, native_response_failed))) {
+      response = std::move(*handled);
+    } else if (command == "help" || command == "h") {
       response = l10n::text(l10n::Key::EngineCommandHelp);
     } else if (command == "u" || command == "disasm") {
       response =
@@ -2259,14 +1668,6 @@ void LldbEngine::run() {
                                std::string{arguments} + " --count 32");
     } else if (command == "k" || command == "kp" || command == "backtrace") {
       response = execute_lldb_command("thread backtrace all");
-    } else if (command == "lm" || command == "modules" ||
-               command == "linkmap") {
-      std::ostringstream modules;
-      for (const ModuleInfo &module : state.modules) {
-        modules << "0x" << std::hex << module.base << "-0x" << module.end << ' '
-                << module.path << '\n';
-      }
-      response = modules.str();
     } else if (command == "ln" || command == "symbol") {
       response = execute_lldb_command(std::string{"image lookup --address "} +
                                       std::string{arguments});
@@ -2312,20 +1713,6 @@ void LldbEngine::run() {
                                       std::to_string(item_size) + ' ' +
                                       std::string{arguments});
       synchronize_after_lldb_command();
-    } else if (command == "pid") {
-      response = state.process_id == 0 ? l10n::text(l10n::Key::EngineNoProcess)
-                                       : std::to_string(state.process_id);
-    } else if (command == "argc") {
-      lldb::SBFrame frame = selected_frame(process);
-      lldb::SBValue argc_value = frame.FindVariable("argc");
-      if (!argc_value.IsValid()) {
-        argc_value = frame.EvaluateExpression("(int)argc");
-      }
-      response =
-          argc_value.IsValid() && argc_value.GetError().Success()
-              ? safe_string(argc_value.GetValue())
-              : l10n::text(
-                    l10n::Key::EngineArgcIsUnavailableInTheSelectedFrame);
     } else if (command == "dumpargs") {
       response = execute_lldb_command("frame variable --show-types --scope");
     } else if (command == "aslr") {
@@ -2341,129 +1728,18 @@ void LldbEngine::run() {
               (setting == "on" ? "false" : "true"));
         }
       }
-    } else if (command == "syscalls") {
-      struct SyscallEntry {
-        int number;
-        const char *name;
-      };
-      constexpr std::array<SyscallEntry, 20> x86_64_syscalls{{
-          {0, "read"},         {1, "write"},    {2, "open"},
-          {3, "close"},        {9, "mmap"},     {10, "mprotect"},
-          {11, "munmap"},      {12, "brk"},     {16, "ioctl"},
-          {39, "getpid"},      {56, "clone"},   {57, "fork"},
-          {58, "vfork"},       {59, "execve"},  {60, "exit"},
-          {61, "wait4"},       {62, "kill"},    {158, "arch_prctl"},
-          {231, "exit_group"}, {257, "openat"},
-      }};
-      constexpr std::array<SyscallEntry, 16> generic_syscalls{{
-          {29, "ioctl"},
-          {56, "openat"},
-          {57, "close"},
-          {63, "read"},
-          {64, "write"},
-          {93, "exit"},
-          {94, "exit_group"},
-          {129, "kill"},
-          {172, "getpid"},
-          {198, "socket"},
-          {214, "brk"},
-          {215, "munmap"},
-          {220, "clone"},
-          {221, "execve"},
-          {222, "mmap"},
-          {226, "mprotect"},
-      }};
-      const bool x86 = state.architecture.find("x86_64") != std::string::npos;
-      std::ostringstream listing;
-      const auto append_matching = [&](const auto &entries) {
-        for (const SyscallEntry &entry : entries) {
-          if (!arguments.empty() && arguments != entry.name &&
-              arguments != std::to_string(entry.number)) {
-            continue;
-          }
-          listing << std::dec << entry.number << ' ' << entry.name << '\n';
-        }
-      };
-      if (x86) {
-        append_matching(x86_64_syscalls);
-      } else {
-        append_matching(generic_syscalls);
-      }
-      response = listing.str();
-      if (response.empty()) {
-        response =
-            l10n::text(l10n::Key::EngineSystemCallNotFoundInBuiltInTable);
-      }
-    } else if (command == "sigreturn") {
-      const bool x86 = state.architecture.find("x86_64") != std::string::npos;
-      std::ostringstream frame;
-      frame << l10n::format(l10n::Key::EngineSigreturnSnapshot, x86 ? 15 : 139,
-                            state.sp);
-      for (const RegisterValue &value : state.registers) {
-        frame << value.name << '=' << value.value << ' ';
-      }
-      frame << l10n::text(
-          l10n::Key::EngineInspectionOnlyNoReturnFrameWasWritten);
-      response = frame.str();
-    } else if (command == "nop" || command == "syscall") {
-      const std::vector<std::string> values = split_arguments(arguments);
-      if (values.empty()) {
-        response = l10n::text(
-            l10n::Key::EngineUsageNopAddressInstructionCountSyscallAddress);
-      } else {
-        std::string failure;
-        const auto address = resolve_address(values[0], process, failure);
-        const auto count = values.size() > 1 ? parse_integer(values[1])
-                                             : std::optional<std::uint64_t>{1};
-        if (!address || !count) {
-          response = error_response(
-              l10n::text(l10n::Key::EngineErrorInvalidAddressOrCount));
-        } else {
-          std::vector<std::uint8_t> instruction;
-          if (state.architecture.find("x86") != std::string::npos) {
-            instruction = command == "nop"
-                              ? std::vector<std::uint8_t>{0x90}
-                              : std::vector<std::uint8_t>{0x0f, 0x05};
-          } else if (state.architecture.find("aarch64") != std::string::npos) {
-            instruction =
-                command == "nop"
-                    ? std::vector<std::uint8_t>{0x1f, 0x20, 0x03, 0xd5}
-                    : std::vector<std::uint8_t>{0x01, 0x00, 0x00, 0xd4};
-          } else if (state.architecture.find("riscv") != std::string::npos) {
-            instruction =
-                command == "nop"
-                    ? std::vector<std::uint8_t>{0x13, 0x00, 0x00, 0x00}
-                    : std::vector<std::uint8_t>{0x73, 0x00, 0x00, 0x00};
-          }
-          if (instruction.empty()) {
-            response = error_response(l10n::text(
-                l10n::Key::EngineErrorNoInstructionEncodingForTarget));
-          } else {
-            std::vector<std::uint8_t> replacement;
-            const std::size_t repetitions = static_cast<std::size_t>(
-                std::clamp<std::uint64_t>(*count, 1, 256));
-            replacement.reserve(instruction.size() * repetitions);
-            for (std::size_t index = 0; index < repetitions; ++index) {
-              replacement.insert(replacement.end(), instruction.begin(),
-                                 instruction.end());
-            }
-            response = apply_patch(*address, replacement);
-          }
-        }
-      }
     } else if (command == "pwndbg") {
       response = l10n::text(l10n::Key::EnginePwndbgHelp);
     } else if (command == "config") {
       std::ostringstream configuration;
-      configuration
-          << "architecture=" << state.architecture << '\n'
-          << "session.mode=" << to_string(state.mode) << '\n'
-          << "disassembly.syntax="
-          << (state.supports_intel_syntax
-                  ? (state.intel_syntax ? "intel" : "att")
-                  : "architecture")
-          << '\n'
-          << "theme=" << (state.theme_dark ? "dark" : "light") << '\n'
+      configuration << "architecture=" << state.architecture << '\n'
+                    << "session.mode=" << to_string(state.mode) << '\n'
+                    << "disassembly.syntax="
+                    << (state.supports_intel_syntax
+                            ? (state.intel_syntax ? "intel" : "att")
+                            : "architecture")
+                    << '\n'
+                    << "theme=" << (state.theme_dark ? "dark" : "light") << '\n'
                     << "search.max-results=256\n"
                     << "heap.max-chunks=256\n"
                     << "launch.args=";
@@ -2498,7 +1774,7 @@ void LldbEngine::run() {
       response =
           state.state == SessionState::Stopped
               ? context_impl(arguments)
-              : error_response(l10n::text(
+              : command_status.error_response(l10n::text(
                     l10n::Key::EngineErrorContextRequiresAStoppedProcess));
     } else if (command == "set" &&
                (arguments == "context-sections" ||
@@ -2530,7 +1806,7 @@ void LldbEngine::run() {
       } else if (action == "delete") {
         const auto index = parse_integer(watch_expression);
         if (!index || *index >= watch_specs.size()) {
-          response = error_response(
+          response = command_status.error_response(
               l10n::text(l10n::Key::EngineErrorContextWatchIndexNotFound));
         } else {
           watch_specs.erase(watch_specs.begin() +
@@ -2555,396 +1831,6 @@ void LldbEngine::run() {
             l10n::Key::
                 EngineUsageCtxWatchEvalExecuteExpressionDeleteIndexClear);
       }
-    } else if (command == "hexdump") {
-      const std::vector<std::string> values = split_arguments(arguments);
-      if (values.empty()) {
-        response = l10n::text(l10n::Key::EngineUsageHexdumpAddressCount);
-      } else {
-        std::string failure;
-        const auto address = resolve_address(values[0], process, failure);
-        const auto parsed_count = values.size() > 1
-                                      ? parse_integer(values[1])
-                                      : std::optional<std::uint64_t>{128};
-        if (!address || !parsed_count) {
-          response = error_detail(
-              failure.empty()
-                  ? std::string{l10n::text(l10n::Key::EngineInvalidByteCount)}
-                  : failure);
-        } else {
-          const std::size_t count = static_cast<std::size_t>(
-              std::clamp<std::uint64_t>(*parsed_count, 1, 4096));
-          const auto bytes =
-              read_memory_bytes(process, *address, count, failure);
-          response =
-              bytes ? format_hexdump(*address, *bytes) : error_detail(failure);
-        }
-      }
-    } else if (command == "telescope" || command == "teles" ||
-               command == "tel") {
-      const std::vector<std::string> values = split_arguments(arguments);
-      std::string failure;
-      const auto address = values.empty()
-                               ? std::optional<lldb::addr_t>{state.sp}
-                               : resolve_address(values[0], process, failure);
-      const auto parsed_count = values.size() > 1
-                                    ? parse_integer(values[1])
-                                    : std::optional<std::uint64_t>{8};
-      if (!address || !parsed_count) {
-        response = error_detail(
-            failure.empty() ? std::string{l10n::text(
-                                  l10n::Key::EngineInvalidTelescopeCount)}
-                            : failure);
-      } else {
-        const std::uint32_t pointer_size =
-            std::max<std::uint32_t>(1, state.address_byte_size);
-        const std::size_t count = static_cast<std::size_t>(
-            std::clamp<std::uint64_t>(*parsed_count, 1, 64));
-        std::ostringstream chain;
-        for (std::size_t index = 0; index < count; ++index) {
-          const lldb::addr_t slot = *address + index * pointer_size;
-          const auto bytes =
-              read_memory_bytes(process, slot, pointer_size, failure);
-          if (!bytes) {
-            chain << "0x" << std::hex << slot << " <" << failure << ">\n";
-            break;
-          }
-          const std::uint64_t value = decode_pointer(
-              bytes->data(), pointer_size, target.GetByteOrder());
-          chain << "0x" << std::hex << slot << " -> 0x" << value;
-          const std::string symbol = symbol_for_address(target, value);
-          if (!symbol.empty()) {
-            chain << " (" << symbol << ')';
-          }
-          if (const MemoryRegionInfo *pointed = region_containing(state, value);
-              pointed != nullptr && pointed->readable) {
-            lldb::SBError string_error;
-            char text_buffer[65]{};
-            const std::size_t bytes_read = process.ReadMemory(
-                value, text_buffer, sizeof(text_buffer) - 1, string_error);
-            std::size_t printable = 0;
-            while (printable < bytes_read && text_buffer[printable] != '\0' &&
-                   std::isprint(static_cast<unsigned char>(
-                       text_buffer[printable])) != 0) {
-              ++printable;
-            }
-            if (printable >= 4) {
-              chain << " \"" << std::string_view{text_buffer, printable} << '"';
-            }
-          }
-          chain << '\n';
-        }
-        response = chain.str();
-      }
-    } else if (command == "p2p") {
-      const std::vector<std::string> values = split_arguments(arguments);
-      if (values.empty()) {
-        response = l10n::text(l10n::Key::EngineUsageP2pAddressDepth);
-      } else {
-        std::string failure;
-        auto current = resolve_address(values[0], process, failure);
-        const auto parsed_depth = values.size() > 1
-                                      ? parse_integer(values[1])
-                                      : std::optional<std::uint64_t>{5};
-        if (!current || !parsed_depth) {
-          response = error_response(
-              l10n::text(l10n::Key::EngineErrorInvalidAddressOrDepth));
-        } else {
-          const std::uint32_t pointer_size =
-              std::max<std::uint32_t>(1, state.address_byte_size);
-          std::vector<std::uint64_t> visited;
-          std::ostringstream chain;
-          const std::size_t depth = static_cast<std::size_t>(
-              std::clamp<std::uint64_t>(*parsed_depth, 1, 32));
-          for (std::size_t level = 0; level < depth; ++level) {
-            chain << "0x" << std::hex << *current;
-            if (std::find(visited.begin(), visited.end(), *current) !=
-                visited.end()) {
-              chain << l10n::text(l10n::Key::EngineCycle);
-              break;
-            }
-            visited.push_back(*current);
-            const auto bytes =
-                read_memory_bytes(process, *current, pointer_size, failure);
-            if (!bytes) {
-              chain << " <" << failure << '>';
-              break;
-            }
-            const std::uint64_t next = decode_pointer(
-                bytes->data(), pointer_size, target.GetByteOrder());
-            chain << " -> ";
-            current = next;
-          }
-          response = chain.str();
-        }
-      }
-    } else if (command == "cyclic") {
-      const std::vector<std::string> values = split_arguments(arguments);
-      if (values.size() == 2 &&
-          (values[0] == "-l" || values[0] == "--lookup")) {
-        std::string query = values[1];
-        if (const auto numeric = parse_integer(query)) {
-          query.clear();
-          for (std::size_t index = 0; index < 8; ++index) {
-            const char byte =
-                static_cast<char>((*numeric >> (index * 8)) & 0xff);
-            if (byte == '\0') {
-              break;
-            }
-            query.push_back(byte);
-          }
-        }
-        const std::string pattern = cyclic_pattern(456976);
-        std::size_t offset = pattern.find(query);
-        if (offset == std::string::npos && query.size() > 4) {
-          offset = pattern.find(query.substr(0, 4));
-        }
-        response = offset == std::string::npos
-                       ? l10n::text(l10n::Key::EngineCyclicValueNotFound)
-                       : std::to_string(offset);
-      } else {
-        const auto length = values.empty() ? std::optional<std::uint64_t>{100}
-                                           : parse_integer(values[0]);
-        response =
-            length ? cyclic_pattern(static_cast<std::size_t>(
-                         std::min<std::uint64_t>(*length, 456976)))
-                   : l10n::text(l10n::Key::EngineUsageCyclicLengthCyclicLValue);
-      }
-    } else if (command == "stack_explore") {
-      std::ostringstream candidates;
-      for (const StackEntry &entry : state.stack) {
-        const MemoryRegionInfo *destination =
-            region_containing(state, entry.value);
-        if (destination == nullptr || !destination->executable) {
-          continue;
-        }
-        candidates << "0x" << std::hex << entry.address << " -> 0x"
-                   << entry.value << ' '
-                   << symbol_for_address(target, entry.value) << ' '
-                   << destination->name << '\n';
-      }
-      response = candidates.str();
-      if (response.empty()) {
-        response = l10n::text(
-            l10n::Key::EngineNoExecutablePointersInCapturedStackWindow);
-      }
-    } else if (command == "valist") {
-      std::string failure;
-      const auto address = resolve_address(arguments, process, failure);
-      if (!address) {
-        response = l10n::text(l10n::Key::EngineUsageValistVaListAddress);
-      } else {
-        const auto bytes = read_memory_bytes(process, *address, 24, failure);
-        if (!bytes) {
-          response = error_detail(failure);
-        } else if (state.architecture.find("x86_64") != std::string::npos) {
-          const std::uint64_t gp_offset =
-              decode_pointer(bytes->data(), 4, target.GetByteOrder());
-          const std::uint64_t fp_offset =
-              decode_pointer(bytes->data() + 4, 4, target.GetByteOrder());
-          const std::uint64_t overflow =
-              decode_pointer(bytes->data() + 8, state.address_byte_size,
-                             target.GetByteOrder());
-          const std::uint64_t register_save =
-              decode_pointer(bytes->data() + 16, state.address_byte_size,
-                             target.GetByteOrder());
-          std::ostringstream value;
-          value << "gp_offset=" << std::dec << gp_offset
-                << " fp_offset=" << fp_offset << " overflow_arg_area=0x"
-                << std::hex << overflow << " reg_save_area=0x" << register_save;
-          response = value.str();
-        } else {
-          response = format_hexdump(*address, *bytes);
-        }
-      }
-    } else if (command == "search") {
-      const std::vector<std::string> values = split_arguments(arguments);
-      std::vector<std::uint8_t> needle;
-      std::string mapping_filter;
-      if (!values.empty() && values[0] == "-x") {
-        if (values.size() < 2) {
-          response = l10n::text(l10n::Key::EngineUsageSearchXAABBMapping);
-        } else {
-          const auto parsed = parse_hex_bytes(values[1]);
-          if (parsed) {
-            needle = *parsed;
-          }
-          if (values.size() > 2) {
-            mapping_filter = values[2];
-          }
-        }
-      } else if (values.size() >= 3 && values[0] == "-t") {
-        const std::string type = lowercase(values[1]);
-        if (type == "string" || type == "str") {
-          needle.assign(values[2].begin(), values[2].end());
-        } else {
-          const auto numeric = parse_integer(values[2]);
-          std::size_t width = 0;
-          if (type == "byte" || type == "u8") {
-            width = 1;
-          } else if (type == "short" || type == "u16") {
-            width = 2;
-          } else if (type == "int" || type == "u32") {
-            width = 4;
-          } else if (type == "long" || type == "pointer" || type == "u64") {
-            width = type == "pointer" ? state.address_byte_size : 8;
-          }
-          if (numeric && width != 0) {
-            needle.resize(width);
-            for (std::size_t index = 0; index < width; ++index) {
-              const std::size_t byte_index =
-                  target.GetByteOrder() == lldb::eByteOrderBig
-                      ? width - 1 - index
-                      : index;
-              needle[byte_index] =
-                  static_cast<std::uint8_t>((*numeric >> (index * 8)) & 0xff);
-            }
-          }
-        }
-        if (values.size() > 3) {
-          mapping_filter = values[3];
-        }
-      } else if (!values.empty()) {
-        needle.assign(values[0].begin(), values[0].end());
-        if (values.size() > 1) {
-          mapping_filter = values[1];
-        }
-      }
-
-      if (response.empty() && needle.empty()) {
-        response = l10n::text(l10n::Key::EngineSearchUsage);
-      } else if (response.empty()) {
-        constexpr std::size_t chunk_size = 64 * 1024;
-        constexpr std::uint64_t scan_limit = 256ULL * 1024 * 1024;
-        constexpr std::size_t result_limit = 256;
-        std::uint64_t scanned = 0;
-        std::size_t result_count = 0;
-        std::ostringstream matches;
-        bool truncated = false;
-        for (const MemoryRegionInfo &region : state.memory_regions) {
-          if (!region.readable ||
-              (!mapping_filter.empty() &&
-               region.name.find(mapping_filter) == std::string::npos)) {
-            continue;
-          }
-          std::vector<std::uint8_t> carry;
-          for (std::uint64_t address = region.start; address < region.end;) {
-            if (scanned >= scan_limit || result_count >= result_limit) {
-              truncated = true;
-              break;
-            }
-            const std::size_t count = static_cast<std::size_t>(
-                std::min<std::uint64_t>(chunk_size, region.end - address));
-            std::vector<std::uint8_t> buffer(carry.size() + count);
-            std::copy(carry.begin(), carry.end(), buffer.begin());
-            lldb::SBError read_error;
-            const std::size_t bytes_read = process.ReadMemory(
-                address, buffer.data() + carry.size(), count, read_error);
-            if (bytes_read == 0) {
-              break;
-            }
-            buffer.resize(carry.size() + bytes_read);
-            auto cursor = buffer.begin();
-            while (cursor != buffer.end()) {
-              cursor = std::search(cursor, buffer.end(), needle.begin(),
-                                   needle.end());
-              if (cursor == buffer.end()) {
-                break;
-              }
-              const std::uint64_t match_address =
-                  address - carry.size() +
-                  static_cast<std::uint64_t>(
-                      std::distance(buffer.begin(), cursor));
-              matches << "0x" << std::hex << match_address << ' ' << region.name
-                      << '\n';
-              ++result_count;
-              if (result_count >= result_limit) {
-                truncated = true;
-                break;
-              }
-              ++cursor;
-            }
-            const std::size_t carry_size =
-                std::min<std::size_t>(needle.size() - 1, buffer.size());
-            carry.assign(buffer.end() - static_cast<std::ptrdiff_t>(carry_size),
-                         buffer.end());
-            address += bytes_read;
-            scanned += bytes_read;
-          }
-          if (truncated) {
-            break;
-          }
-        }
-        if (result_count == 0) {
-          matches << l10n::text(l10n::Key::EnginePatternNotFound);
-        }
-        if (truncated) {
-          matches << l10n::format(l10n::Key::EngineSearchTruncated,
-                                  result_count, scanned);
-        }
-        response = matches.str();
-      }
-    } else if (command == "xuntil" || command == "stepuntilasm" ||
-               command == "nextcall" || command == "nextproginstr" ||
-               command == "nextbranch" || command == "nextjmp" ||
-               command == "nextret" || command == "stepret" ||
-               command == "nextsyscall" || command == "stepsyscall") {
-      const std::vector<std::string> values = split_arguments(arguments);
-      std::size_t instruction_limit = 256;
-      if ((command == "xuntil" || command == "stepuntilasm") &&
-          values.size() > 1) {
-        if (const auto parsed = parse_integer(values[1])) {
-          instruction_limit = static_cast<std::size_t>(
-              std::clamp<std::uint64_t>(*parsed, 1, 4096));
-        }
-      }
-      if ((command == "xuntil" || command == "stepuntilasm") &&
-          values.empty()) {
-        response =
-            l10n::text(l10n::Key::EngineUsageXuntilMnemonicMaxInstructions);
-      } else {
-        lldb::SBInstructionList instructions = target.ReadInstructions(
-            target.ResolveLoadAddress(state.pc),
-            static_cast<std::uint32_t>(instruction_limit));
-        std::optional<lldb::addr_t> destination;
-        for (std::size_t index = 1; index < instructions.GetSize(); ++index) {
-          lldb::SBInstruction instruction = instructions.GetInstructionAtIndex(
-              static_cast<std::uint32_t>(index));
-          const std::string mnemonic =
-              lowercase(safe_string(instruction.GetMnemonic(target)));
-          bool matches = false;
-          if (command == "xuntil" || command == "stepuntilasm") {
-            matches = mnemonic.find(lowercase(values[0])) != std::string::npos;
-          } else if (command == "nextproginstr") {
-            matches = true;
-          } else if (command == "nextcall") {
-            matches = mnemonic.starts_with("call") || mnemonic == "bl" ||
-                      mnemonic == "blr" || mnemonic == "jal" ||
-                      mnemonic == "jalr";
-          } else if (command == "nextjmp" || command == "nextbranch") {
-            matches = mnemonic.starts_with("j") || mnemonic.starts_with("b") ||
-                      mnemonic == "cbz" || mnemonic == "cbnz";
-          } else if (command == "nextret" || command == "stepret") {
-            matches =
-                mnemonic.starts_with("ret") ||
-                (mnemonic == "jr" &&
-                 safe_string(instruction.GetOperands(target)).find("ra") !=
-                     std::string::npos);
-          } else {
-            matches = mnemonic == "syscall" || mnemonic == "sysenter" ||
-                      mnemonic == "int" || mnemonic == "svc" ||
-                      mnemonic == "ecall";
-          }
-          if (matches) {
-            destination = instruction.GetAddress().GetLoadAddress(target);
-            break;
-          }
-        }
-        response =
-            destination
-                ? run_to_address_impl(*destination)
-                : l10n::format(l10n::Key::EngineMatchingInstructionNotFound,
-                               instruction_limit);
-      }
     } else if (command == "cymbol") {
       const std::vector<std::string> values = split_arguments(arguments);
       if (values.empty() || values[0] == "-l") {
@@ -2966,7 +1852,7 @@ void LldbEngine::run() {
             persistent_symbols.begin(), persistent_symbols.end(),
             [&](const auto &candidate) { return candidate.name == values[1]; });
         if (symbol == custom_symbols.end() && !saved_symbol) {
-          response = error_response(
+          response = command_status.error_response(
               l10n::text(l10n::Key::EngineErrorCustomSymbolNotFound));
         } else {
           if (symbol != custom_symbols.end())
@@ -2980,7 +1866,7 @@ void LldbEngine::run() {
         std::string failure;
         const auto address = resolve_address(values[1], process, failure);
         if (!address) {
-          response = error_detail(failure);
+          response = command_status.error_detail(failure);
         } else {
           const auto existing =
               std::find_if(custom_symbols.begin(), custom_symbols.end(),
@@ -3020,7 +1906,7 @@ void LldbEngine::run() {
                            return candidate.first == values[0];
                          });
         if (symbol == custom_symbols.end()) {
-          response = error_response(
+          response = command_status.error_response(
               l10n::text(l10n::Key::EngineErrorCustomSymbolNotFound));
         } else {
           std::ostringstream address_text;
@@ -3038,7 +1924,7 @@ void LldbEngine::run() {
         std::string failure;
         const auto address = resolve_address(values[1], process, failure);
         if (!address) {
-          response = error_detail(failure);
+          response = command_status.error_detail(failure);
         } else {
           std::ostringstream expression;
           expression << "expression -- *(" << values[0] << "*)0x" << std::hex
@@ -3046,730 +1932,11 @@ void LldbEngine::run() {
           response = execute_lldb_command(expression.str());
         }
       }
-    } else if (command == "plist") {
-      const std::vector<std::string> values = split_arguments(arguments);
-      if (values.empty()) {
-        response = l10n::text(
-            l10n::Key::EngineUsagePlistHeadAddressNextPointerOffsetMaxNodes);
-      } else {
-        std::string failure;
-        auto current = resolve_address(values[0], process, failure);
-        const auto offset = values.size() > 1 ? parse_integer(values[1])
-                                              : std::optional<std::uint64_t>{0};
-        const auto maximum = values.size() > 2
-                                 ? parse_integer(values[2])
-                                 : std::optional<std::uint64_t>{32};
-        if (!current || !offset || !maximum) {
-          response = error_response(l10n::text(
-              l10n::Key::EngineErrorInvalidListAddressOffsetOrCount));
-        } else {
-          const std::uint32_t pointer_size =
-              std::max<std::uint32_t>(1, state.address_byte_size);
-          std::vector<std::uint64_t> visited;
-          std::ostringstream nodes;
-          for (std::uint64_t index = 0;
-               index < std::min<std::uint64_t>(*maximum, 256) && *current != 0;
-               ++index) {
-            nodes << index << ": 0x" << std::hex << *current << '\n';
-            if (std::find(visited.begin(), visited.end(), *current) !=
-                visited.end()) {
-              nodes << l10n::text(l10n::Key::EngineCycleDetected);
-              break;
-            }
-            visited.push_back(*current);
-            const auto bytes = read_memory_bytes(process, *current + *offset,
-                                                 pointer_size, failure);
-            if (!bytes) {
-              nodes << l10n::format(l10n::Key::EngineErrorDetail,
-                                    failure.c_str())
-                    << '\n';
-              break;
-            }
-            current = decode_pointer(bytes->data(), pointer_size,
-                                     target.GetByteOrder());
-          }
-          response = nodes.str();
-        }
-      }
-    } else if (command == "heap_config") {
-      std::ostringstream configuration;
-      const auto libc_module = std::find_if(
-          state.modules.begin(), state.modules.end(),
-          [](const ModuleInfo &module) {
-            return module.path.find("libc.so") != std::string::npos;
-          });
-      configuration << "allocator=glibc\n"
-                    << "pointer-size=" << state.address_byte_size << '\n'
-                    << "byte-order=" << state.byte_order << '\n'
-                    << "safe-linking-decode=enabled\n"
-                    << "heap-chunk-limit=256\n"
-                    << "libc="
-                    << (libc_module == state.modules.end()
-                            ? l10n::text(l10n::Key::EngineNotDetected)
-                            : libc_module->path)
-                    << "\nwalk-status="
-                    << (state.heap_error.empty()
-                            ? l10n::text(l10n::Key::EngineOk)
-                            : state.heap_error);
-      response = configuration.str();
-    } else if (command == "heap" || command == "vis_heap_chunks" ||
-               command == "malloc_chunk" || command == "bins" ||
-               command == "fastbins" || command == "tcachebins" ||
-               command == "unsortedbin" || command == "smallbins" ||
-               command == "largebins") {
-      std::optional<std::uint64_t> requested_address;
-      if (!arguments.empty() && command != "vis_heap_chunks") {
-        std::string failure;
-        requested_address = resolve_address(arguments, process, failure);
-        if (!requested_address && command == "malloc_chunk") {
-          response = error_detail(failure);
-        }
-      }
-      if (response.empty()) {
-        std::ostringstream chunks;
-        const std::uint64_t fast_max =
-            state.address_byte_size == 4 ? 0x50 : 0x90;
-        const std::uint64_t small_max =
-            state.address_byte_size == 4 ? 0x200 : 0x400;
-        for (const HeapChunkInfo &chunk : state.heap_chunks) {
-          if (requested_address &&
-              (*requested_address < chunk.address ||
-               *requested_address >= chunk.address + chunk.size)) {
-            continue;
-          }
-          if (command == "fastbins" &&
-              (chunk.in_use || chunk.size > fast_max)) {
-            continue;
-          }
-          if (command == "tcachebins" &&
-              (chunk.in_use || chunk.size > small_max)) {
-            continue;
-          }
-          if (command == "unsortedbin" &&
-              (chunk.in_use || chunk.size <= fast_max)) {
-            continue;
-          }
-          if (command == "smallbins" &&
-              (chunk.in_use || chunk.size <= fast_max ||
-               chunk.size > small_max)) {
-            continue;
-          }
-          if (command == "largebins" &&
-              (chunk.in_use || chunk.size <= small_max)) {
-            continue;
-          }
-          chunks << "0x" << std::hex << chunk.address
-                 << l10n::text(l10n::Key::EngineSizeAddress) << chunk.size
-                 << l10n::text(l10n::Key::EnginePrevSizeAddress)
-                 << chunk.previous_size << l10n::text(l10n::Key::EngineFlags)
-                 << ((chunk.flags & 1U) != 0 ? 'P' : '-')
-                 << ((chunk.flags & 2U) != 0 ? 'M' : '-')
-                 << ((chunk.flags & 4U) != 0 ? 'A' : '-') << ' '
-                 << (chunk.in_use ? l10n::text(l10n::Key::EngineInUse)
-                                  : l10n::text(l10n::Key::EngineFree));
-          if (!chunk.in_use) {
-            const std::uint64_t user_address =
-                chunk.address + state.address_byte_size * 2;
-            chunks << l10n::text(l10n::Key::EngineFdAddress) << chunk.forward
-                   << l10n::text(l10n::Key::EngineSafeFdAddress)
-                   << (chunk.forward ^ (user_address >> 12))
-                   << l10n::text(l10n::Key::EngineBkAddress) << chunk.backward;
-          }
-          chunks << '\n';
-          if (command == "vis_heap_chunks") {
-            chunks << l10n::text(l10n::Key::EngineNextAddress)
-                   << (chunk.address + chunk.size) << '\n';
-          }
-        }
-        if (!state.heap_error.empty()) {
-          chunks << '[' << state.heap_error << "]\n";
-        }
-        response = chunks.str();
-        if (response.empty()) {
-          response = l10n::text(l10n::Key::EngineNoMatchingGlibcHeapChunks);
-        }
-      }
-    } else if (command == "arena" || command == "arenas" || command == "mp") {
-      std::ostringstream allocator;
-      std::size_t used = 0;
-      std::size_t free = 0;
-      std::uint64_t bytes = 0;
-      for (const HeapChunkInfo &chunk : state.heap_chunks) {
-        bytes += chunk.size;
-        if (chunk.in_use) {
-          ++used;
-        } else {
-          ++free;
-        }
-      }
-      allocator << l10n::format(l10n::Key::EngineHeapSummary,
-                                state.heap_chunks.size(), used, free, bytes);
-      if (const auto heap = std::find_if(state.memory_regions.begin(),
-                                         state.memory_regions.end(),
-                                         [](const MemoryRegionInfo &region) {
-                                           return region.name == "[heap]";
-                                         });
-          heap != state.memory_regions.end()) {
-        allocator << l10n::format(l10n::Key::EngineArenaMapping, heap->start,
-                                  heap->end);
-      }
-      if (!state.heap_error.empty()) {
-        allocator << state.heap_error;
-      }
-      response = allocator.str();
-    } else if (command == "find_fake_fast") {
-      std::string failure;
-      const auto target_address = resolve_address(arguments, process, failure);
-      if (!target_address) {
-        response = l10n::text(l10n::Key::EngineUsageFindFakeFastAddress);
-      } else {
-        const std::uint32_t pointer_size =
-            std::max<std::uint32_t>(1, state.address_byte_size);
-        const std::uint64_t alignment = pointer_size * 2;
-        const std::uint64_t fast_max = pointer_size == 4 ? 0x50 : 0x90;
-        const std::uint64_t search_start =
-            *target_address > 0x100 ? *target_address - 0x100 : 0;
-        std::ostringstream candidates;
-        for (std::uint64_t header =
-                 (search_start + alignment - 1) & ~(alignment - 1);
-             header + pointer_size * 2 <= *target_address;
-             header += alignment) {
-          const auto bytes = read_memory_bytes(process, header + pointer_size,
-                                               pointer_size, failure);
-          if (!bytes) {
-            continue;
-          }
-          const std::uint64_t size_and_flags = decode_pointer(
-              bytes->data(), pointer_size, target.GetByteOrder());
-          const std::uint64_t size = size_and_flags & ~0x7ULL;
-          if (size >= alignment && size <= fast_max &&
-              header + size >= *target_address) {
-            candidates << "0x" << std::hex << header
-                       << l10n::text(l10n::Key::EngineSizeAddress) << size
-                       << '\n';
-          }
-        }
-        response = candidates.str();
-        if (response.empty()) {
-          response =
-              l10n::text(l10n::Key::EngineNoPlausibleFastbinSizedFakeChunk);
-        }
-      }
-    } else if (command == "try_free") {
-      std::string failure;
-      const auto user_address = resolve_address(arguments, process, failure);
-      if (!user_address) {
-        response = l10n::text(l10n::Key::EngineUsageTryFreeUserPointer);
-      } else {
-        const std::uint64_t header_size = state.address_byte_size * 2;
-        const auto chunk = std::find_if(
-            state.heap_chunks.begin(), state.heap_chunks.end(),
-            [user_address, header_size](const HeapChunkInfo &candidate) {
-              return candidate.address + header_size == *user_address;
-            });
-        if (chunk == state.heap_chunks.end()) {
-          response = l10n::text(
-              l10n::Key::EngineUnsafePointerIsNotADiscoveredChunkPayload);
-        } else if (!chunk->in_use) {
-          response = l10n::text(l10n::Key::EngineUnsafeChunkAppearsAlreadyFree);
-        } else if ((chunk->size % (state.address_byte_size * 2)) != 0) {
-          response = l10n::text(l10n::Key::EngineUnsafeChunkSizeIsMisaligned);
-        } else {
-          std::ostringstream result;
-          result << l10n::format(l10n::Key::EnginePlausibleFree, *user_address,
-                                 chunk->address, chunk->size);
-          response = result.str();
-        }
-      }
-    } else if (command == "patch") {
-      const std::vector<std::string> values = split_arguments(arguments);
-      if (values.size() < 2) {
-        response = l10n::text(l10n::Key::EngineUsagePatchAddressHexBytes);
-      } else {
-        std::string failure;
-        const auto address = resolve_address(values[0], process, failure);
-        std::string byte_text;
-        for (std::size_t index = 1; index < values.size(); ++index) {
-          if (!byte_text.empty()) {
-            byte_text.push_back(' ');
-          }
-          byte_text += values[index];
-        }
-        const auto replacement = parse_hex_bytes(byte_text);
-        response =
-            address && replacement
-                ? apply_patch(*address, *replacement)
-                : error_response(l10n::text(
-                      l10n::Key::EngineErrorInvalidAddressOrHexadecimalBytes));
-      }
-    } else if (command == "assemble" || command == "asm") {
-      const std::size_t instruction_separator = arguments.find_first_of(" \t");
-      const std::string_view address_text =
-          instruction_separator == std::string_view::npos
-              ? arguments
-              : arguments.substr(0, instruction_separator);
-      const std::string_view instruction =
-          instruction_separator == std::string_view::npos
-              ? std::string_view{}
-              : trim(arguments.substr(instruction_separator + 1));
-      if (address_text.empty() || instruction.empty()) {
-        response = l10n::text(
-            l10n::Key::EngineUsageAssembleAddressIntelSyntaxInstruction);
-      } else {
-        std::string failure;
-        const auto address = resolve_address(address_text, process, failure);
-        const auto replacement =
-            address
-                ? assemble_intel_instruction(instruction, *address,
-                                             state.architecture,
-                                             state.address_byte_size, failure)
-                : std::nullopt;
-        response = address && replacement ? apply_patch(*address, *replacement)
-                                          : error_detail(failure);
-      }
-    } else if (command == "patch_list") {
-      std::ostringstream patches;
-      for (const PatchInfo &patch : state.patches) {
-        patches << patch.id << " 0x" << std::hex << patch.address
-                << l10n::text(l10n::Key::EngineOriginal);
-        for (std::uint8_t byte : patch.original) {
-          patches << std::setw(2) << std::setfill('0')
-                  << static_cast<unsigned int>(byte);
-        }
-        patches << l10n::text(l10n::Key::EngineReplacement);
-        for (std::uint8_t byte : patch.replacement) {
-          patches << std::setw(2) << std::setfill('0')
-                  << static_cast<unsigned int>(byte);
-        }
-        patches << '\n';
-      }
-      response = patches.str();
-      if (response.empty()) {
-        response = l10n::text(l10n::Key::EngineNoActivePatches);
-      }
-    } else if (command == "patch_revert") {
-      const auto requested = parse_integer(arguments);
-      if (!requested) {
-        response = l10n::text(l10n::Key::EngineUsagePatchRevertIdAddress);
-      } else {
-        auto patch = std::find_if(state.patches.begin(), state.patches.end(),
-                                  [requested](const PatchInfo &candidate) {
-                                    return candidate.id == *requested ||
-                                           candidate.address == *requested;
-                                  });
-        if (patch == state.patches.end()) {
-          response =
-              error_response(l10n::text(l10n::Key::EngineErrorPatchNotFound));
-        } else {
-          lldb::SBError write_error;
-          const std::size_t written =
-              process.WriteMemory(patch->address, patch->original.data(),
-                                  patch->original.size(), write_error);
-          state.disassembly_graph.reset();
-          if (write_error.Fail() || written != patch->original.size()) {
-            response = error_detail(error_text(write_error));
-          } else {
-            const std::uint32_t patch_id = patch->id;
-            state.patches.erase(patch);
-            if (!state.memory.empty()) {
-              capture_memory(process, state.memory_base, state);
-            }
-            if (!state.instructions.empty()) {
-              capture_instructions(target, state.instructions.front().address,
-                                   state);
-            }
-            response = l10n::format(l10n::Key::EnginePatchReverted, patch_id);
-          }
-        }
-      }
-    } else if (command == "vmmap" || command == "mmap" || command == "memmap" ||
-               command == "!address") {
-      std::string address_failure;
-      const auto requested_address =
-          arguments.empty()
-              ? std::nullopt
-              : resolve_address(arguments, process, address_failure);
-      std::ostringstream mappings;
-      for (const MemoryRegionInfo &region : state.memory_regions) {
-        if (requested_address && (*requested_address < region.start ||
-                                  *requested_address >= region.end)) {
-          continue;
-        }
-        if (!arguments.empty() && !requested_address &&
-            region.name.find(arguments) == std::string::npos) {
-          continue;
-        }
-        mappings << "0x" << std::hex << region.start << "-0x" << region.end
-                 << ' ' << permission_text(region) << ' ' << region.name
-                 << '\n';
-      }
-      response = mappings.str();
-      if (response.empty()) {
-        response = l10n::text(l10n::Key::EngineNoMatchingMemoryMappings);
-      }
-    } else if (command == "xinfo" || command == "examine") {
-      std::string address_failure;
-      const auto address = resolve_address(arguments, process, address_failure);
-      if (!address) {
-        response =
-            l10n::text(l10n::Key::EngineUsageXinfoAddressRegisterExpression);
-      } else {
-        std::ostringstream information;
-        information << l10n::text(l10n::Key::EngineAddressAddress) << std::hex
-                    << *address << '\n';
-        if (const MemoryRegionInfo *region =
-                region_containing(state, *address)) {
-          information << l10n::text(l10n::Key::EngineMappingAddress)
-                      << region->start << "-0x" << region->end << ' '
-                      << permission_text(*region) << ' ' << region->name
-                      << l10n::text(l10n::Key::EngineOffsetAddress)
-                      << (*address - region->start) << '\n';
-        }
-        lldb::SBAddress resolved = target.ResolveLoadAddress(*address);
-        if (resolved.IsValid()) {
-          information << l10n::text(l10n::Key::EngineModule)
-                      << module_path(resolved.GetModule())
-                      << l10n::text(l10n::Key::EngineSection)
-                      << safe_string(resolved.GetSection().GetName())
-                      << l10n::text(l10n::Key::EngineFileAddressAddress)
-                      << resolved.GetFileAddress() << '\n';
-        }
-        const std::string symbol = symbol_for_address(target, *address);
-        if (!symbol.empty()) {
-          information << l10n::text(l10n::Key::EngineSymbol) << symbol << '\n';
-        }
-        response = information.str();
-      }
-    } else if (command == "piebase") {
-      std::ostringstream bases;
-      for (std::size_t index = 0; index < target.GetNumModules(); ++index) {
-        lldb::SBModule module =
-            target.GetModuleAtIndex(static_cast<std::uint32_t>(index));
-        const std::string path = module_path(module);
-        if (!arguments.empty() && path.find(arguments) == std::string::npos) {
-          continue;
-        }
-        lldb::SBAddress header = module.GetObjectFileHeaderAddress();
-        const lldb::addr_t load = header.GetLoadAddress(target);
-        if (load != LLDB_INVALID_ADDRESS) {
-          bases << "0x" << std::hex << load << ' ' << path << '\n';
-        }
-        if (arguments.empty()) {
-          break;
-        }
-      }
-      response = bases.str();
-      if (response.empty()) {
-        response = l10n::text(l10n::Key::EngineModuleNotFoundOrNotLoaded);
-      }
-    } else if (command == "got" || command == "gotplt" || command == "plt") {
-      const std::vector<std::string_view> wanted =
-          command == "got" ? std::vector<std::string_view>{".got", ".got.plt"}
-          : command == "gotplt"
-              ? std::vector<std::string_view>{".got.plt"}
-              : std::vector<std::string_view>{".plt", ".plt.sec"};
-      std::ostringstream listing;
-      for (std::size_t module_index = 0; module_index < target.GetNumModules();
-           ++module_index) {
-        lldb::SBModule module =
-            target.GetModuleAtIndex(static_cast<std::uint32_t>(module_index));
-        const std::string path = module_path(module);
-        if (!arguments.empty() && path.find(arguments) == std::string::npos) {
-          continue;
-        }
-        for (std::string_view section_name : wanted) {
-          std::vector<lldb::SBSection> matches;
-          for (std::size_t section_index = 0;
-               section_index < module.GetNumSections(); ++section_index) {
-            collect_matching_sections(module.GetSectionAtIndex(section_index),
-                                      section_name, matches);
-          }
-          for (lldb::SBSection section : matches) {
-            const lldb::addr_t load = section.GetLoadAddress(target);
-            listing << path << ' ' << section_name << " 0x" << std::hex << load
-                    << "-0x" << (load + section.GetByteSize()) << '\n';
-            if (command == "plt") {
-              lldb::SBInstructionList instructions =
-                  target.ReadInstructions(target.ResolveLoadAddress(load), 32);
-              for (std::size_t instruction_index = 0;
-                   instruction_index < instructions.GetSize();
-                   ++instruction_index) {
-                lldb::SBInstruction instruction =
-                    instructions.GetInstructionAtIndex(
-                        static_cast<std::uint32_t>(instruction_index));
-                listing << "  0x"
-                        << instruction.GetAddress().GetLoadAddress(target)
-                        << ' ' << safe_string(instruction.GetMnemonic(target))
-                        << ' ' << safe_string(instruction.GetOperands(target))
-                        << '\n';
-              }
-              continue;
-            }
-            const std::uint32_t pointer_size =
-                std::max<std::uint32_t>(1, state.address_byte_size);
-            const std::size_t slots = std::min<std::size_t>(
-                section.GetByteSize() / pointer_size, 256);
-            for (std::size_t slot = 0; slot < slots; ++slot) {
-              std::string failure;
-              const auto bytes = read_memory_bytes(
-                  process, load + slot * pointer_size, pointer_size, failure);
-              if (!bytes) {
-                listing << "  <" << failure << ">\n";
-                break;
-              }
-              const std::uint64_t value = decode_pointer(
-                  bytes->data(), pointer_size, target.GetByteOrder());
-              listing << "  0x" << (load + slot * pointer_size) << " -> 0x"
-                      << value;
-              const std::string symbol = symbol_for_address(target, value);
-              if (!symbol.empty()) {
-                listing << ' ' << symbol;
-              }
-              listing << '\n';
-            }
-          }
-        }
-      }
-      response = listing.str();
-      if (response.empty()) {
-        response = l10n::text(l10n::Key::EngineMatchingSectionNotFound);
-      }
-    } else if (command == "checksec") {
-      if (!state.security.available) {
-        response = l10n::text(l10n::Key::EngineELFSecurityMetadataUnavailable);
-      } else {
-        std::ostringstream security;
-        security << l10n::text(l10n::Key::EnginePIE)
-                 << (state.security.pie ? l10n::text(l10n::Key::EngineEnabled)
-                                        : l10n::text(l10n::Key::EngineDisabled))
-                 << l10n::text(l10n::Key::EngineNX)
-                 << (state.security.nx ? l10n::text(l10n::Key::EngineEnabled)
-                                       : l10n::text(l10n::Key::EngineDisabled))
-                 << l10n::text(l10n::Key::EngineRELRO)
-                 << (state.security.full_relro
-                         ? l10n::text(l10n::Key::EngineFull)
-                     : state.security.relro
-                         ? l10n::text(l10n::Key::EnginePartial)
-                         : l10n::text(l10n::Key::EngineNone))
-                 << l10n::text(l10n::Key::EngineCanary)
-                 << (state.security.stack_canary
-                         ? l10n::text(l10n::Key::EngineFound)
-                         : l10n::text(l10n::Key::EngineNotFound))
-                 << l10n::text(l10n::Key::EngineSymbols)
-                 << (state.security.stripped
-                         ? l10n::text(l10n::Key::EngineStripped)
-                         : l10n::text(l10n::Key::EnginePresent));
-        response = security.str();
-      }
-    } else if (command == "auxv") {
-      if (state.mode != SessionMode::Local || state.process_is_remote) {
-        response = error_response(l10n::text(
-            l10n::Key::
-                EngineErrorAuxvHostLookupIsUnavailableForRemoteSessions));
-      } else if (state.process_id == 0) {
-        response = error_response(l10n::text(l10n::Key::EngineErrorNoProcess));
-      } else {
-        const std::filesystem::path auxv_path =
-            std::filesystem::path{"/proc"} / std::to_string(state.process_id) /
-            "auxv";
-        std::ifstream auxv_file{auxv_path, std::ios::binary};
-        const std::vector<std::uint8_t> bytes{
-            std::istreambuf_iterator<char>{auxv_file},
-            std::istreambuf_iterator<char>{}};
-        const std::uint32_t width = state.address_byte_size;
-        std::ostringstream entries;
-        if (width == 0 || bytes.size() % (width * 2) != 0) {
-          response = error_response(
-              l10n::text(l10n::Key::EngineErrorInvalidProcAuxiliaryVector));
-        } else {
-          const auto name_for_type = [](std::uint64_t type) {
-            switch (type) {
-            case 3:
-              return "AT_PHDR";
-            case 4:
-              return "AT_PHENT";
-            case 5:
-              return "AT_PHNUM";
-            case 6:
-              return "AT_PAGESZ";
-            case 7:
-              return "AT_BASE";
-            case 9:
-              return "AT_ENTRY";
-            case 11:
-              return "AT_UID";
-            case 12:
-              return "AT_EUID";
-            case 13:
-              return "AT_GID";
-            case 14:
-              return "AT_EGID";
-            case 15:
-              return "AT_PLATFORM";
-            case 16:
-              return "AT_HWCAP";
-            case 17:
-              return "AT_CLKTCK";
-            case 23:
-              return "AT_SECURE";
-            case 25:
-              return "AT_RANDOM";
-            case 26:
-              return "AT_HWCAP2";
-            case 31:
-              return "AT_EXECFN";
-            case 33:
-              return "AT_SYSINFO_EHDR";
-            default:
-              return "AT_UNKNOWN";
-            }
-          };
-          for (std::size_t offset = 0; offset + width * 2 <= bytes.size();
-               offset += width * 2) {
-            const std::uint64_t type = decode_pointer(
-                bytes.data() + offset, width, target.GetByteOrder());
-            const std::uint64_t value = decode_pointer(
-                bytes.data() + offset + width, width, target.GetByteOrder());
-            if (type == 0) {
-              break;
-            }
-            entries << name_for_type(type) << '(' << std::dec << type
-                    << ") = 0x" << std::hex << value << '\n';
-          }
-          response = entries.str();
-        }
-      }
     } else if (command == "elfsections") {
       response = execute_lldb_command(
           arguments.empty()
               ? "image dump sections"
               : std::string{"image dump sections "} + std::string{arguments});
-    } else if (command == "kbase" || command == "kchecksec") {
-      response = l10n::text(l10n::Key::EngineKernelSessionsUnsupported);
-    } else if (command == "tls") {
-      lldb::SBFrame frame = selected_frame(process);
-      const std::array<const char *, 4> register_names{"fs_base", "tpidr_el0",
-                                                       "tp", "gs_base"};
-      std::ostringstream tls;
-      for (const char *name : register_names) {
-        lldb::SBValue value = frame.FindRegister(name);
-        if (value.IsValid()) {
-          tls << name << "=0x" << std::hex << value.GetValueAsUnsigned()
-              << '\n';
-        }
-      }
-      response = tls.str();
-      if (response.empty()) {
-        response = l10n::text(
-            l10n::Key::EngineTLSBaseRegisterIsUnavailableForThisTarget);
-      }
-    } else if (command == "retaddr") {
-      lldb::SBThread thread = process.GetSelectedThread();
-      std::ostringstream addresses;
-      for (std::uint32_t index = 1; index < thread.GetNumFrames(); ++index) {
-        lldb::SBFrame frame = thread.GetFrameAtIndex(index);
-        addresses << '#' << index << " 0x" << std::hex << frame.GetPC() << ' '
-                  << safe_string(frame.GetFunctionName()) << '\n';
-      }
-      response = addresses.str();
-      if (response.empty()) {
-        response = l10n::text(l10n::Key::EngineNoSavedReturnAddress);
-      }
-    } else if (command == "canary") {
-      lldb::SBFrame frame = selected_frame(process);
-      std::optional<std::uint64_t> canary_address;
-      lldb::SBValue fs_base = frame.FindRegister("fs_base");
-      if (fs_base.IsValid()) {
-        canary_address = fs_base.GetValueAsUnsigned() + 0x28;
-      } else {
-        lldb::SBValue guard = frame.EvaluateExpression("&__stack_chk_guard");
-        if (guard.IsValid() && guard.GetError().Success()) {
-          canary_address = guard.GetValueAsUnsigned();
-        }
-      }
-      if (!canary_address) {
-        response = l10n::text(l10n::Key::EngineStackCanaryLocationUnavailable);
-      } else {
-        std::string failure;
-        const auto bytes = read_memory_bytes(process, *canary_address,
-                                             state.address_byte_size, failure);
-        if (!bytes) {
-          response = error_detail(failure);
-        } else {
-          std::ostringstream canary;
-          canary << "0x" << std::hex << *canary_address << ": 0x"
-                 << decode_pointer(bytes->data(), state.address_byte_size,
-                                   target.GetByteOrder());
-          response = canary.str();
-        }
-      }
-    } else if (command == "distance") {
-      const std::vector<std::string> values = split_arguments(arguments);
-      if (values.size() != 2) {
-        response = l10n::text(l10n::Key::EngineUsageDistanceAddressAddress);
-      } else {
-        std::string first_failure;
-        std::string second_failure;
-        const auto first = resolve_address(values[0], process, first_failure);
-        const auto second = resolve_address(values[1], process, second_failure);
-        if (!first || !second) {
-          response = error_response(
-              l10n::text(l10n::Key::EngineErrorCouldNotResolveBothAddresses));
-        } else {
-          const std::int64_t delta =
-              static_cast<std::int64_t>(*second - *first);
-          std::ostringstream difference;
-          difference << l10n::format(
-              l10n::Key::EngineAddressDistance, delta,
-              state.address_byte_size == 0
-                  ? std::int64_t{0}
-                  : delta / static_cast<std::int64_t>(state.address_byte_size),
-              static_cast<std::uint64_t>(delta));
-          response = difference.str();
-        }
-      }
-    } else if (command == "procinfo") {
-      if (state.mode != SessionMode::Local || state.process_is_remote) {
-        response = error_response(l10n::text(
-            l10n::Key::
-                EngineErrorProcinfoHostLookupIsUnavailableForRemoteSessions));
-      } else if (state.process_id == 0) {
-        response = error_response(l10n::text(l10n::Key::EngineErrorNoProcess));
-      } else {
-        const std::filesystem::path process_root =
-            std::filesystem::path{"/proc"} / std::to_string(state.process_id);
-        std::ifstream status_file{process_root / "status"};
-        std::ostringstream information;
-        std::string line;
-        while (std::getline(status_file, line)) {
-          if (line.starts_with("Name:") || line.starts_with("State:") ||
-              line.starts_with("Pid:") || line.starts_with("PPid:") ||
-              line.starts_with("Uid:") || line.starts_with("Gid:") ||
-              line.starts_with("Threads:") || line.starts_with("Seccomp:")) {
-            information << line << '\n';
-          }
-        }
-        std::ifstream command_file{process_root / "cmdline", std::ios::binary};
-        std::string process_command_line{
-            std::istreambuf_iterator<char>{command_file},
-            std::istreambuf_iterator<char>{}};
-        std::replace(process_command_line.begin(), process_command_line.end(),
-                     '\0', ' ');
-        information << l10n::text(l10n::Key::EngineCmdline)
-                    << process_command_line << '\n';
-        response = information.str();
-      }
-    } else if (command == "errno") {
-      lldb::SBFrame frame = selected_frame(process);
-      lldb::SBValue value = frame.EvaluateExpression("(int)errno");
-      if (!value.IsValid() || value.GetError().Fail()) {
-        response = error_response(
-            l10n::text(l10n::Key::EngineErrorUnableToReadDebuggeeErrno));
-      } else {
-        const int error_number = static_cast<int>(value.GetValueAsSigned());
-        response = std::to_string(error_number) + " (" +
-                   std::strerror(error_number) + ')';
-      }
     } else if (command == "start" || command == "sstart") {
       if (!arguments.empty())
         launch_arguments = split_arguments(arguments);
@@ -3788,7 +1955,7 @@ void LldbEngine::run() {
       if (!process_id) {
         response = l10n::text(l10n::Key::EngineUsageAttachpPid);
       } else if (!target.IsValid()) {
-        response = error_response(l10n::text(
+        response = command_status.error_response(l10n::text(
             l10n::Key::EngineErrorSelectTheProcessExecutableBeforeAttach));
       } else {
         lldb::SBError attach_error;
@@ -3796,7 +1963,7 @@ void LldbEngine::run() {
             listener, static_cast<lldb::pid_t>(*process_id), attach_error);
         if (attach_error.Fail() || !process.IsValid()) {
           state.error = error_text(attach_error);
-          response = error_detail(state.error);
+          response = command_status.error_detail(state.error);
         } else {
           response =
               l10n::format(l10n::Key::EngineAttachedToProcess, *process_id);
@@ -3817,7 +1984,7 @@ void LldbEngine::run() {
         const lldb::addr_t base =
             module.GetObjectFileHeaderAddress().GetLoadAddress(target);
         if (base == LLDB_INVALID_ADDRESS) {
-          response = error_response(
+          response = command_status.error_response(
               l10n::text(l10n::Key::EngineErrorExecutableIsNotLoaded));
         } else {
           std::ostringstream specification;
@@ -3842,7 +2009,7 @@ void LldbEngine::run() {
                  process.GetState() != lldb::eStateExited &&
                  process.GetState() != lldb::eStateDetached &&
                  process.GetState() != lldb::eStateInvalid) {
-        response = error_response(l10n::text(
+        response = command_status.error_response(l10n::text(
             l10n::Key::
                 EngineErrorTerminateTheCurrentProcessBeforeSelectingATarget));
       } else {
@@ -3856,7 +2023,7 @@ void LldbEngine::run() {
                                        true, target_error);
         if (target_error.Fail() || !target.IsValid()) {
           state.error = error_text(target_error);
-          response = error_detail(state.error);
+          response = command_status.error_detail(state.error);
         } else {
           response = l10n::format(l10n::Key::EngineTargetCreated,
                                   paths.front().c_str());
@@ -3992,7 +2159,7 @@ void LldbEngine::run() {
     } else if (command == "undisplay") {
       const auto index = parse_integer(arguments);
       if (!index || *index >= watch_specs.size()) {
-        response = error_response(
+        response = command_status.error_response(
             l10n::text(l10n::Key::EngineErrorDisplayIndexNotFound));
       } else {
         watch_specs.erase(watch_specs.begin() +
@@ -4026,52 +2193,15 @@ void LldbEngine::run() {
       response = id ? enable_breakpoint_impl(static_cast<std::uint32_t>(*id),
                                              command == "be")
                     : l10n::text(l10n::Key::EngineUsageBeBdBreakpointId);
-    } else if (command == "g" || command == "go" || command == "c" ||
-               command == "continue") {
-      response = continue_impl();
-    } else if (command == "pause" || command == "breakin") {
-      response = stop_impl();
     } else if (command == "dump" || command == "x") {
       std::string failure;
       const auto address = resolve_address(arguments, process, failure);
-      response = address ? dump_memory_impl(*address) : error_detail(failure);
-    } else if (command == "t" || command == "step" || command == "p" ||
-               command == "next" || command == "ti" || command == "si" ||
-               command == "stepi" || command == "pi" || command == "ni" ||
-               command == "nexti") {
-      if (state.state != SessionState::Stopped || !process.IsValid()) {
-        response = error_response(
-            l10n::text(l10n::Key::EngineErrorSteppingRequiresAStoppedProcess));
-      } else {
-        lldb::SBThread thread = process.GetSelectedThread();
-        if (!thread.IsValid()) {
-          response = error_response(
-              l10n::text(l10n::Key::EngineErrorNoSelectedThread));
-        } else {
-          lldb::SBError step_error;
-          if (command == "t" || command == "step") {
-            thread.StepInto();
-          } else if (command == "p" || command == "next") {
-            thread.StepOver();
-          } else {
-            const bool step_over =
-                command == "pi" || command == "ni" || command == "nexti";
-            thread.StepInstruction(step_over, step_error);
-          }
-          if (step_error.Fail()) {
-            response = error_detail(error_text(step_error));
-          } else {
-            state.state = SessionState::Running;
-            state.crash = {};
-            state.error.clear();
-            response = l10n::text(l10n::Key::EngineStepping);
-          }
-        }
-      }
+      response = address ? dump_memory_impl(*address)
+                         : command_status.error_detail(failure);
     } else if (command == "r" || command == "reg" || command == "regs" ||
                command == "registers") {
       if (state.state != SessionState::Stopped || !process.IsValid()) {
-        response = error_response(
+        response = command_status.error_response(
             l10n::text(l10n::Key::EngineErrorRegistersRequireAStoppedProcess));
       } else if (arguments.empty()) {
         std::ostringstream registers;
@@ -4096,7 +2226,7 @@ void LldbEngine::run() {
         lldb::SBValue value = frame.IsValid() ? frame.FindRegister(name.c_str())
                                               : lldb::SBValue{};
         if (!value.IsValid()) {
-          response = error_response(
+          response = command_status.error_response(
               l10n::text(l10n::Key::EngineErrorRegisterNotFound));
         } else if (new_value.empty()) {
           response = name + " = " + safe_string(value.GetValue());
@@ -4104,7 +2234,7 @@ void LldbEngine::run() {
           lldb::SBError write_error;
           const std::string value_text{new_value};
           if (!value.SetValueFromCString(value_text.c_str(), write_error)) {
-            response = error_detail(error_text(write_error));
+            response = command_status.error_detail(error_text(write_error));
           } else {
             capture_stop(target, process, memory_view_address,
                          instruction_view_address, state);
@@ -4118,7 +2248,7 @@ void LldbEngine::run() {
       if (syntax != "intel" && syntax != "att") {
         response = l10n::text(l10n::Key::EngineUsageSyntaxIntelAtt);
       } else if (target.IsValid() && !state.supports_intel_syntax) {
-        response = error_response(l10n::text(
+        response = command_status.error_response(l10n::text(
             l10n::Key::EngineErrorIntelATTSyntaxAppliesOnlyToX86Targets));
       } else {
         state.intel_syntax = syntax == "intel";
@@ -4130,18 +2260,18 @@ void LldbEngine::run() {
             l10n::format(l10n::Key::EngineDisassemblySyntax, syntax.c_str());
       }
     } else if (command == "process" &&
-               (arguments == "connect" ||
-                arguments.starts_with("connect "))) {
-      std::string endpoint{arguments.substr(std::string_view{"connect"}.size())};
+               (arguments == "connect" || arguments.starts_with("connect "))) {
+      std::string endpoint{
+          arguments.substr(std::string_view{"connect"}.size())};
       while (!endpoint.empty() &&
              std::isspace(static_cast<unsigned char>(endpoint.front())) != 0) {
         endpoint.erase(endpoint.begin());
       }
       if (endpoint.empty()) {
-        response = error_response(
+        response = command_status.error_response(
             l10n::text(l10n::Key::EngineErrorProcessConnectRequiresAnEndpoint));
       } else if (!target.IsValid()) {
-        response = error_response(
+        response = command_status.error_response(
             l10n::text(l10n::Key::EngineErrorProcessConnectRequiresATarget));
       } else {
         if (endpoint.find("://") == std::string::npos) {
@@ -4156,29 +2286,16 @@ void LldbEngine::run() {
         connect_remote_process(endpoint, connect_error);
         if (shutdown_requested_.load()) {
           state.error = l10n::text(l10n::Key::EngineRemoteConnectionCancelled);
-          response = error_detail(state.error);
+          response = command_status.error_detail(state.error);
         } else if (connect_error.Fail() || !process.IsValid()) {
           state.state = SessionState::Error;
           state.error = error_text(connect_error);
-          response = error_detail(state.error);
+          response = command_status.error_detail(state.error);
         } else {
           synchronize_after_lldb_command(true);
           state.error.clear();
           response = l10n::text(l10n::Key::EngineConnected);
         }
-      }
-    } else if (command == "?") {
-      lldb::SBFrame frame = selected_frame(process);
-      if (!frame.IsValid()) {
-        response = error_response(l10n::text(
-            l10n::Key::EngineErrorExpressionEvaluationRequiresAFrame));
-      } else {
-        const std::string expression{arguments};
-        lldb::SBValue value = frame.EvaluateExpression(expression.c_str());
-        const lldb::SBError expression_error = value.GetError();
-        response = expression_error.Fail()
-                       ? error_detail(error_text(expression_error))
-                       : safe_string(value.GetValue());
       }
     } else if (const auto plugin_response =
                    plugins::PluginRegistry::instance().execute(
@@ -4209,7 +2326,7 @@ void LldbEngine::run() {
   publish();
 
   auto read_frameless_register_result = [&](Command &command,
-                                             std::string &failure) {
+                                            std::string &failure) {
     const auto numeric = read_frameless_qemu_mips_register(
         target, state, command.argument, failure);
     if (!numeric) {
@@ -4362,7 +2479,7 @@ void LldbEngine::run() {
         debugger.HandleCommand(
             (std::string{"settings set target.input-path "} +
              (options.stdin_path.empty() ? std::string{"\"\""}
-                                          : options.stdin_path))
+                                         : options.stdin_path))
                 .c_str());
         std::vector<const char *> argument_pointers;
         argument_pointers.reserve(options.arguments.size() + 1);
@@ -4433,7 +2550,8 @@ void LldbEngine::run() {
         }
         lldb::SBError attach_error;
         adopt_process(target.AttachToProcessWithID(
-            listener, static_cast<lldb::pid_t>(command.value), attach_error),
+                          listener, static_cast<lldb::pid_t>(command.value),
+                          attach_error),
                       false);
         if (attach_error.Fail() || !process.IsValid()) {
           state.state = SessionState::Error;
@@ -4466,10 +2584,9 @@ void LldbEngine::run() {
         state.mode = options.mode;
         state.target_path = options.executable;
         state.local_symbol_path = options.executable;
-        state.security =
-            state.local_symbol_path.empty()
-                ? ElfSecurityInfo{}
-                : inspect_elf_security(state.local_symbol_path);
+        state.security = state.local_symbol_path.empty()
+                             ? ElfSecurityInfo{}
+                             : inspect_elf_security(state.local_symbol_path);
         state.target_triple.clear();
         state.architecture.clear();
         state.byte_order.clear();
@@ -4494,56 +2611,23 @@ void LldbEngine::run() {
             endpoint.find("://") == std::string::npos) {
           endpoint.insert(0, "connect://");
         }
-        if (!options.qemu_executable.empty()) {
-          // Engine-owned qemu-user stub: spawn, own the target's stdin, and
-          // connect. Symbol breakpoints resolve through the engine's ELF
-          // symbol table (LLDB 21 cannot bind pending breakpoints over
-          // gdb-remote).
-          std::string spawn_failure;
-          const auto port = pick_stub_port(spawn_failure);
-          if (!port) {
-            state.state = SessionState::Error;
-            state.error = l10n::format(l10n::Key::EngineQemuPortUnavailable,
-                                       spawn_failure.c_str());
-            publish();
-            break;
-          }
-          const auto child = spawn_qemu_stub(
-              options.qemu_executable, options.sysroot, options.executable,
-              options.arguments, options.working_directory,
-              options.stdin_file, *port, spawn_failure);
-          if (!child) {
-            state.state = SessionState::Error;
-            state.error = l10n::format(l10n::Key::EngineQemuSpawnFailed,
-                                       spawn_failure.c_str());
-            publish();
-            break;
-          }
-          qemu_pid_ = child->pid;
-          qemu_stdin_fd_ = child->stdin_fd;
-          qemu_stdout_fd_ = child->stdout_fd;
-          if (!wait_stub_listen(*port)) {
-            stop_qemu_child();
-            state.state = SessionState::Error;
-            state.error = l10n::format(
-                l10n::Key::EngineQemuSpawnFailed,
-                "the gdbstub port never listened");
-            publish();
-            break;
-          }
-          endpoint = "connect://127.0.0.1:" + std::to_string(*port);
+        if (!options.qemu_executable.empty() &&
+            !qemu.start(options, endpoint, state.error)) {
+          state.state = SessionState::Error;
+          publish();
+          break;
         }
         state.state = SessionState::Connecting;
         publish();
         lldb::SBError connect_error;
         connect_remote_process(endpoint, connect_error);
         if (shutdown_requested_.load()) {
-          stop_qemu_child();
+          qemu.stop();
           state.error = l10n::text(l10n::Key::EngineRemoteConnectionCancelled);
           break;
         }
         if (connect_error.Fail() || !process.IsValid()) {
-          stop_qemu_child();
+          qemu.stop();
           state.state = SessionState::Error;
           state.error = error_text(connect_error);
           publish();
@@ -4566,7 +2650,7 @@ void LldbEngine::run() {
           publish();
           break;
         }
-        stop_qemu_child();
+        qemu.stop();
         adopt_process(lldb::SBProcess{});
         state.state = target.IsValid() ? SessionState::TargetLoaded
                                        : SessionState::NoTarget;
@@ -4579,11 +2663,11 @@ void LldbEngine::run() {
         break;
       }
       case CommandKind::Continue:
-        continue_impl();
+        continue_process(target, process, state, native_response_failed);
         publish();
         break;
       case CommandKind::Stop:
-        stop_impl();
+        pause_process(process, state, native_response_failed);
         publish();
         break;
       case CommandKind::StepInstruction:
@@ -4591,12 +2675,13 @@ void LldbEngine::run() {
         publish();
         break;
       case CommandKind::RunToAddress:
-        run_to_address_impl(command.value);
+        lldb_detail::run_to_address(command.value, process, state,
+                                    native_response_failed);
         publish();
         break;
       case CommandKind::Terminate:
-        terminate_impl();
-        stop_qemu_child();
+        terminate_process(process, state, native_response_failed);
+        qemu.stop();
         publish();
         break;
       case CommandKind::SetConditionalBreakpoint:
@@ -4742,11 +2827,13 @@ void LldbEngine::run() {
         constexpr std::size_t maximum_write_size = 16U * 1024U * 1024U;
         if (command.bytes.empty() ||
             command.bytes.size() > maximum_write_size) {
-          command_message = error_response(l10n::text(
+          command_message = command_status.error_response(l10n::text(
               l10n::Key::
                   EngineErrorMemoryWriteSizeMustBeBetween1And16777216Bytes));
         } else {
-          command_message = apply_patch(command.value, command.bytes);
+          command_message = patch_commands.apply_patch(
+              command.value, command.bytes, target, process, state,
+              native_response_failed);
         }
         publish();
         break;
@@ -4757,8 +2844,26 @@ void LldbEngine::run() {
           state.error = l10n::text(
               l10n::Key::EngineExpressionEvaluationRequiresAStoppedFrame);
         } else if (frame.IsValid()) {
-          lldb::SBValue value =
-              frame.EvaluateExpression(command.argument.c_str());
+          lldb::SBValue value;
+          const std::string_view expression = trim(command.argument);
+          if (expression.size() > 1 && expression.front() == '$') {
+            const std::string_view name = expression.substr(1);
+            const bool bare_register =
+                (std::isalpha(static_cast<unsigned char>(name.front())) ||
+                 name.front() == '_') &&
+                std::all_of(name.begin(), name.end(), [](unsigned char c) {
+                  return std::isalnum(c) || c == '_';
+                });
+            if (bare_register) {
+              // Read register references without importing their bytes into
+              // LLDB's expression evaluator, which can use the host byte order.
+              const std::string register_name{name};
+              value = frame.FindRegister(register_name.c_str());
+            }
+          }
+          if (!value.IsValid()) {
+            value = frame.EvaluateExpression(command.argument.c_str());
+          }
           const lldb::SBError expression_error = value.GetError();
           if (expression_error.Fail() || !value.IsValid()) {
             state.error = error_text(expression_error);
@@ -4882,23 +2987,8 @@ void LldbEngine::run() {
         break;
       }
       case CommandKind::SendStdin: {
-        if (qemu_stdin_fd_ >= 0) {
-          // Engine-owned qemu-user stub: the target's stdin is our pipe.
-          std::size_t written = 0;
-          while (written < command.argument.size()) {
-            const ssize_t count = write(qemu_stdin_fd_,
-                                        command.argument.data() + written,
-                                        command.argument.size() - written);
-            if (count < 0 && errno != EINTR) {
-              state.error = l10n::format(
-                  l10n::Key::EngineQemuStdinFailed, strerror(errno));
-              publish();
-              break;
-            }
-            if (count >= 0) {
-              written += static_cast<std::size_t>(count);
-            }
-          }
+        if (qemu.owns_stdin()) {
+          qemu.send_stdin(command.argument, state.error);
           if (state.error.empty()) {
             command_message = l10n::format(l10n::Key::EngineSentInputBytes,
                                            command.argument.size());
@@ -5066,7 +3156,7 @@ void LldbEngine::run() {
         state.exit_status = process.GetExitStatus();
         state.stop_reason = safe_string(process.GetExitDescription());
         state.error.clear();
-        drain_qemu_stdout();
+        qemu.drain_output();
       }
       publish();
     }
@@ -5074,7 +3164,7 @@ void LldbEngine::run() {
     if (append_process_output(process, state)) {
       publish();
     }
-    drain_qemu_stdout();
+    qemu.drain_output();
     publish();
 
     std::unique_lock lock{mutex_};
@@ -5082,7 +3172,7 @@ void LldbEngine::run() {
   }
 
   save_session();
-  stop_qemu_child();
+  qemu.stop();
   state.state = SessionState::ShuttingDown;
   publish();
   if (process.IsValid() && should_destroy(process.GetState())) {
@@ -5098,6 +3188,5 @@ void LldbEngine::run() {
   }
   lldb::SBDebugger::Destroy(debugger);
 }
-
 
 } // namespace debugger

@@ -1,4 +1,5 @@
 #include "app/AppState.h"
+#include "backend/lldb/LldbEngine.h"
 
 #include "app/AppActions.h"
 #include "app/AppMenus.h"
@@ -107,21 +108,22 @@ void draw_session_panel(const debugger::SessionSnapshot &snapshot,
                         debugger::LldbEngine &engine, UiState &ui,
                         bool control_lease) {
   ImGui::Begin(l10n::label(l10n::Key::WindowSession));
-  const auto session_input = debugger_sync_session_input(ui);
+  const auto session_input = debugger_sync_session_input(ui.session, ui.files);
 
   ImGui::TextUnformatted(l10n::text(l10n::Key::GuiPanelsExecutable));
   const float browse_width =
       ImGui::CalcTextSize(l10n::text(l10n::Key::GuiPanelsBrowse)).x +
       ImGui::GetStyle().FramePadding.x * 2.0F;
   ImGui::SetNextItemWidth(-(browse_width + ImGui::GetStyle().ItemSpacing.x));
-  ImGui::InputText("##elf-executable", ui.executable_path.data(),
-                   ui.executable_path.size());
+  ImGui::InputText("##elf-executable", ui.session.executable_path.data(),
+                   ui.session.executable_path.size());
   ImGui::SameLine();
   ImGui::BeginDisabled(session_input.file_dialog_open);
   if (ImGui::Button(session_input.file_dialog_open
                         ? l10n::label(l10n::Key::GuiPanelsSelectingExecutable)
                         : l10n::label(l10n::Key::GuiPanelsBrowse))) {
-    show_executable_dialog(ui);
+    show_executable_dialog(ui.files, ui.main_window,
+                           ui.session.executable_path.data());
   }
   ImGui::EndDisabled();
   draw_error_text(session_input.file_dialog_error);
@@ -133,38 +135,38 @@ void draw_session_panel(const debugger::SessionSnapshot &snapshot,
       ImGui::SetTooltip("%s", snapshot.session.sha256.c_str());
     ImGui::TextWrapped(
         l10n::text(l10n::Key::GuiSessionCounts),
-        ui.session_status.breakpoint_count, ui.session_status.watch_count,
-        ui.session_status.edit_count, ui.session_status.comment_count);
+        ui.session.status.breakpoint_count, ui.session.status.watch_count,
+        ui.session.status.edit_count, ui.session.status.comment_count);
     const bool clearable =
         snapshot.state == debugger::SessionState::Stopped ||
         snapshot.state == debugger::SessionState::TargetLoaded ||
         snapshot.state == debugger::SessionState::Exited ||
         snapshot.state == debugger::SessionState::Error;
     ImGui::BeginDisabled(control_lease || !clearable ||
-                         ui.session_clear.valid());
+                         ui.session.clear.valid());
     if (ImGui::Button(l10n::label(l10n::Key::GuiSessionClear))) {
-      ui.session_action_message.clear();
-      ui.session_clear = engine.clear_saved_session(snapshot.session.sha256);
+      ui.session.action_message.clear();
+      ui.session.clear = engine.clear_saved_session(snapshot.session.sha256);
     }
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       ImGui::SetTooltip("%s", l10n::text(l10n::Key::GuiSessionClearHelp));
-    if (ui.session_status.writable && ui.session_status.error.empty())
+    if (ui.session.status.writable && ui.session.status.error.empty())
       ImGui::TextDisabled("%s", l10n::text(l10n::Key::GuiSessionAutosaved));
   } else {
     ImGui::TextDisabled("%s", l10n::text(l10n::Key::GuiSessionUnavailable));
   }
-  if (!ui.session_status.error.empty())
+  if (!ui.session.status.error.empty())
     ImGui::TextWrapped(l10n::text(l10n::Key::GuiSessionStorageError),
-                       ui.session_status.error.c_str());
+                       ui.session.status.error.c_str());
   if (!snapshot.session_error.empty())
     ImGui::TextWrapped("%s", snapshot.session_error.c_str());
-  if (!ui.session_action_message.empty())
-    ImGui::TextWrapped("%s", ui.session_action_message.c_str());
+  if (!ui.session.action_message.empty())
+    ImGui::TextWrapped("%s", ui.session.action_message.c_str());
   ImGui::SeparatorText(l10n::text(l10n::Key::GuiPanelsLocalProcess));
   ImGui::BeginDisabled(control_lease);
   if (ImGui::Button(l10n::label(l10n::Key::GuiPanelsLaunchRestart))) {
-    engine.launch(ui.executable_path.data());
+    engine.launch(ui.session.executable_path.data());
   }
   if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
     ImGui::SetTooltip("%s", l10n::text(l10n::Key::GuiPanelsLaunchHelp));
@@ -201,11 +203,12 @@ void draw_session_panel(const debugger::SessionSnapshot &snapshot,
       -(ImGui::CalcTextSize(l10n::text(l10n::Key::GuiPanelsAttach)).x +
         ImGui::GetStyle().FramePadding.x * 2.0F +
         ImGui::GetStyle().ItemSpacing.x));
-  ImGui::InputScalar("##attach-pid", ImGuiDataType_U64, &ui.attach_process_id);
+  ImGui::InputScalar("##attach-pid", ImGuiDataType_U64,
+                     &ui.session.attach_process_id);
   ImGui::SameLine();
-  ImGui::BeginDisabled(control_lease || ui.attach_process_id == 0);
+  ImGui::BeginDisabled(control_lease || ui.session.attach_process_id == 0);
   if (ImGui::Button(l10n::label(l10n::Key::GuiPanelsAttach))) {
-    engine.attach(ui.attach_process_id);
+    engine.attach(ui.session.attach_process_id);
   }
   ImGui::EndDisabled();
 
@@ -216,31 +219,31 @@ void draw_session_panel(const debugger::SessionSnapshot &snapshot,
       l10n::text(l10n::Key::GuiPanelsRemoteProfileQemuSystem)};
   ImGui::TextUnformatted(l10n::text(l10n::Key::GuiPanelsProfile));
   ImGui::SetNextItemWidth(-1.0F);
-  ImGui::Combo("##remote-profile", &ui.remote_profile, remote_profiles,
+  ImGui::Combo("##remote-profile", &ui.session.remote_profile, remote_profiles,
                static_cast<int>(std::size(remote_profiles)));
   ImGui::TextUnformatted(l10n::text(l10n::Key::GuiPanelsEndpoint));
   ImGui::SetNextItemWidth(-1.0F);
-  ImGui::InputText("##remote-endpoint", ui.remote_endpoint.data(),
-                   ui.remote_endpoint.size());
+  ImGui::InputText("##remote-endpoint", ui.session.remote_endpoint.data(),
+                   ui.session.remote_endpoint.size());
   const debugger::SessionMode remote_mode =
-      ui.remote_profile == 1
+      ui.session.remote_profile == 1
           ? debugger::SessionMode::QemuUser
-          : (ui.remote_profile == 2 ? debugger::SessionMode::QemuSystem
-                                    : debugger::SessionMode::Remote);
-  ImGui::BeginDisabled(control_lease || ui.remote_endpoint[0] == '\0');
+          : (ui.session.remote_profile == 2 ? debugger::SessionMode::QemuSystem
+                                            : debugger::SessionMode::Remote);
+  ImGui::BeginDisabled(control_lease || ui.session.remote_endpoint[0] == '\0');
   if (ImGui::Button(l10n::label(l10n::Key::GuiPanelsConnect))) {
     engine.connect_remote(debugger::RemoteOptions{
-        .executable = ui.executable_path.data(),
-        .endpoint = ui.remote_endpoint.data(),
+        .executable = ui.session.executable_path.data(),
+        .endpoint = ui.session.remote_endpoint.data(),
         .mode = remote_mode,
     });
   }
   ImGui::EndDisabled();
   ImGui::PushStyleColor(ImGuiCol_Text,
                         ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-  if (ui.remote_profile == 1) {
+  if (ui.session.remote_profile == 1) {
     ImGui::TextWrapped("%s", l10n::text(l10n::Key::GuiPanelsQemuUserHelp));
-  } else if (ui.remote_profile == 2) {
+  } else if (ui.session.remote_profile == 2) {
     ImGui::TextWrapped("%s", l10n::text(l10n::Key::GuiPanelsQemuSystemHelp));
   } else {
     ImGui::TextWrapped("%s",
@@ -262,7 +265,7 @@ void draw_session_panel(const debugger::SessionSnapshot &snapshot,
   }
   ImGui::SameLine();
   if (ImGui::Button(l10n::label(l10n::Key::GuiPanelsRunToCursorShortcut))) {
-    engine.run_to_address(ui.disassembly_cursor);
+    engine.run_to_address(ui.navigation.disassembly_cursor);
   }
   ImGui::EndDisabled();
   ImGui::BeginDisabled(!can_terminate(snapshot));
@@ -316,21 +319,20 @@ void draw_session_panel(const debugger::SessionSnapshot &snapshot,
     for (auto entry = snapshot.stop_history.rbegin();
          entry != snapshot.stop_history.rend(); ++entry) {
       ImGui::PushID(static_cast<int>(entry->stop_revision));
-      const bool selected =
-          ui.selected_history_generation == entry->generation &&
-          ui.selected_history_stop == entry->stop_revision;
+      const bool selected = ui.history.generation == entry->generation &&
+                            ui.history.stop == entry->stop_revision;
       const std::string label =
           l10n::format(l10n::Key::GuiPanelsStopHistoryEntry,
                        entry->stop_revision, entry->pc,
                        entry->stop_reason.c_str()) +
           "###history-entry";
       if (ImGui::Selectable(label.c_str(), selected)) {
-        ui.selected_history_generation = entry->generation;
-        ui.selected_history_stop = entry->stop_revision;
+        ui.history.generation = entry->generation;
+        ui.history.stop = entry->stop_revision;
       }
       ImGui::PopID();
     }
-    const auto *selected = debugger_selected_history(snapshot, ui);
+    const auto *selected = debugger_selected_history(snapshot, ui.history);
     if (selected != nullptr &&
         ImGui::BeginTable("history-registers", 3,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
@@ -416,45 +418,46 @@ const char *branch_summary_text(const debugger::InstructionRow &instruction) {
 void draw_comment_editor(const debugger::SessionSnapshot &snapshot,
                          debugger::LldbEngine &engine, UiState &ui,
                          bool control_lease) {
-  if (ui.comment_editor_requested) {
+  if (ui.comments.editor_requested) {
     ImGui::OpenPopup(l10n::label(l10n::Key::GuiSessionCommentEditor));
-    ui.comment_editor_requested = false;
+    ui.comments.editor_requested = false;
   }
   if (!ImGui::BeginPopupModal(
           l10n::label(l10n::Key::GuiSessionCommentEditor), nullptr,
           ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings))
     return;
-  if (!debugger_validate_comment(snapshot, ui, control_lease)) {
+  if (!debugger_validate_comment(snapshot, ui.comments, ui.session,
+                                 control_lease)) {
     ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
     return;
   }
-  if (debugger_complete_comment(ui)) {
+  if (debugger_complete_comment(ui.comments)) {
     ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
     return;
   }
   ImGui::Text(l10n::text(l10n::Key::GuiSessionCommentAddress),
-              *ui.comment_address);
+              *ui.comments.address);
   ImGui::TextWrapped("%s", l10n::text(l10n::Key::GuiSessionCommentHelp));
-  ImGui::BeginDisabled(ui.comment_write.valid());
+  ImGui::BeginDisabled(ui.comments.write.valid());
   ImGui::InputTextMultiline(
-      "##session-comment", ui.comment_text.data(), ui.comment_text.size(),
+      "##session-comment", ui.comments.text.data(), ui.comments.text.size(),
       ImVec2(ImGui::GetFontSize() * 42.0F, ImGui::GetTextLineHeight() * 8.0F),
       ImGuiInputTextFlags_AllowTabInput);
-  if (!ui.comment_error.empty())
-    ImGui::TextWrapped("%s", ui.comment_error.c_str());
+  if (!ui.comments.error.empty())
+    ImGui::TextWrapped("%s", ui.comments.error.c_str());
   if (ImGui::Button(l10n::label(l10n::Key::GuiSessionSaveComment)))
-    ui.comment_write = engine.set_comment(
-        *ui.comment_address, ui.comment_text.data(), ui.comment_generation);
+    ui.comments.write = engine.set_comment(
+        *ui.comments.address, ui.comments.text.data(), ui.comments.generation);
   ImGui::SameLine();
   if (ImGui::Button(l10n::label(l10n::Key::GuiSessionDeleteComment)))
-    ui.comment_write =
-        engine.set_comment(*ui.comment_address, {}, ui.comment_generation);
+    ui.comments.write =
+        engine.set_comment(*ui.comments.address, {}, ui.comments.generation);
   ImGui::SameLine();
   if (ImGui::Button(l10n::label(l10n::Key::GuiPanelsCancel)) ||
-      (!ui.comment_write.valid() && ImGui::IsKeyPressed(ImGuiKey_Escape))) {
-    ui.comment_address.reset();
+      (!ui.comments.write.valid() && ImGui::IsKeyPressed(ImGuiKey_Escape))) {
+    ui.comments.address.reset();
     ImGui::CloseCurrentPopup();
   }
   ImGui::EndDisabled();
@@ -465,16 +468,16 @@ void draw_instruction_context_actions(
     const debugger::SessionSnapshot &snapshot, debugger::LldbEngine &engine,
     UiState &ui, const debugger::InstructionRow &instruction,
     bool control_lease) {
-  ui.disassembly_cursor = instruction.address;
+  ui.navigation.disassembly_cursor = instruction.address;
   ImGui::BeginDisabled(control_lease);
   draw_breakpoint_context_actions(snapshot, engine, ui, instruction.address);
   ImGui::EndDisabled();
-  ImGui::BeginDisabled(control_lease || ui.session_clear.valid() ||
+  ImGui::BeginDisabled(control_lease || ui.session.clear.valid() ||
                        snapshot.state != debugger::SessionState::Stopped ||
                        snapshot.session.epoch.empty() ||
                        !instruction.has_file_address);
   if (ImGui::MenuItem(l10n::label(l10n::Key::GuiSessionEditComment)))
-    debugger_request_comment_editor(snapshot, ui, instruction.address,
+    debugger_request_comment_editor(snapshot, ui.comments, instruction.address,
                                     instruction.user_comment);
   ImGui::EndDisabled();
   ImGui::Separator();
@@ -501,7 +504,7 @@ void draw_instruction_context_actions(
   }
   ImGui::EndDisabled();
   if (ImGui::MenuItem(l10n::label(l10n::Key::GuiPanelsFollowMemory))) {
-    follow_memory(engine, ui, instruction.address);
+    follow_memory(engine, ui.memory, instruction.address);
   }
   if (ImGui::MenuItem(l10n::label(l10n::Key::GuiPanelsShowMemoryMap))) {
     show_in_memory_map(ui, instruction.address);
@@ -514,10 +517,10 @@ void draw_disassembly_panel(const debugger::SessionSnapshot &snapshot,
   ImGui::Begin(l10n::label(l10n::Key::WindowDisassembly));
   dispatch_navigation_shortcuts(snapshot, engine, ui, false, control_lease);
   if (ImGui::Checkbox(l10n::label(l10n::Key::GuiPanelsGraphView),
-                      &ui.disassembly_graph_view)) {
+                      &ui.navigation.disassembly_graph_view)) {
     ImGui::MarkIniSettingsDirty();
-    if (!ui.disassembly_graph_view) {
-      ui.disassembly_graph_state.reset();
+    if (!ui.navigation.disassembly_graph_view) {
+      ui.navigation.disassembly_graph_state.reset();
     }
   }
   debugger_sync_disassembly_mode(snapshot, engine, ui);
@@ -538,7 +541,7 @@ void draw_disassembly_panel(const debugger::SessionSnapshot &snapshot,
   ImGui::SameLine();
   ImGui::TextDisabled("%s", l10n::text(l10n::Key::GuiPanelsDisassemblyHelp));
 
-  if (ui.disassembly_graph_view) {
+  if (ui.navigation.disassembly_graph_view) {
     draw_disassembly_graph(snapshot, engine, ui, control_lease);
     ImGui::BeginDisabled(control_lease);
     draw_instruction_patch_editor(snapshot, engine, ui);
@@ -547,7 +550,7 @@ void draw_disassembly_panel(const debugger::SessionSnapshot &snapshot,
     return;
   }
   const bool follow_requested =
-      std::exchange(ui.navigation_follow_requested, false);
+      std::exchange(ui.navigation.follow_requested, false);
   const auto &io = ImGui::GetIO();
   const bool keyboard_navigation =
       !control_lease && snapshot.state == debugger::SessionState::Stopped &&
@@ -565,8 +568,9 @@ void draw_disassembly_panel(const debugger::SessionSnapshot &snapshot,
     ImGui::TableSetupColumn(l10n::label(l10n::Key::GuiPanelsBranchColumn));
     ImGui::TableHeadersRow();
     ImGui::TableSetColumnIndex(3);
-    const auto &presentations = disassembly_presentations(
-        ui.disassembly_text_cache, snapshot, ImGui::GetContentRegionAvail().x);
+    const auto &presentations =
+        disassembly_presentations(ui.navigation.disassembly_text_cache,
+                                  snapshot, ImGui::GetContentRegionAvail().x);
     std::optional<std::uint64_t> keyboard_scroll_target;
     auto cursor = debugger_disassembly_cursor(snapshot, ui);
     if (keyboard_navigation && !snapshot.instructions.empty()) {
@@ -595,8 +599,9 @@ void draw_disassembly_panel(const debugger::SessionSnapshot &snapshot,
       ImGui::TableNextRow();
       if (instruction.address == snapshot.pc) {
         ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
-                               ui.theme_dark ? IM_COL32(160, 140, 40, 65)
-                                             : IM_COL32(230, 190, 30, 55));
+                               ui.workspace.theme_dark
+                                   ? IM_COL32(160, 140, 40, 65)
+                                   : IM_COL32(230, 190, 30, 55));
       }
       ImGui::TableSetColumnIndex(0);
       char address_label[64]{};
@@ -609,28 +614,30 @@ void draw_disassembly_panel(const debugger::SessionSnapshot &snapshot,
         ImGui::PushStyleColor(color, tint);
       }
       if (ImGui::Selectable(
-              address_label, ui.disassembly_cursor == instruction.address,
+              address_label,
+              ui.navigation.disassembly_cursor == instruction.address,
               ImGuiSelectableFlags_SpanAllColumns,
               ImVec2(0.0F, std::max(ImGui::GetTextLineHeight(),
                                     presentation.annotation.size.y))) &&
           !follow_requested) {
-        ui.disassembly_cursor = instruction.address;
+        ui.navigation.disassembly_cursor = instruction.address;
       }
       ImGui::PopStyleColor(3);
       if (keyboard_scroll_target == instruction.address) {
         ImGui::SetScrollHereY(0.5F);
       }
-      if (ui.disassembly_scroll_target == instruction.address &&
+      if (ui.navigation.disassembly_scroll_target == instruction.address &&
           snapshot.instructions.front().address == instruction.address) {
         ImGui::SetScrollHereY(0.5F);
-        ui.disassembly_scroll_target.reset();
+        ui.navigation.disassembly_scroll_target.reset();
       }
       if (instruction.address == snapshot.pc &&
-          (ui.disassembly_scroll_generation != snapshot.generation ||
-           ui.disassembly_scroll_stop_revision != snapshot.stop_revision)) {
+          (ui.navigation.disassembly_scroll_generation != snapshot.generation ||
+           ui.navigation.disassembly_scroll_stop_revision !=
+               snapshot.stop_revision)) {
         ImGui::SetScrollHereY(0.5F);
-        ui.disassembly_scroll_generation = snapshot.generation;
-        ui.disassembly_scroll_stop_revision = snapshot.stop_revision;
+        ui.navigation.disassembly_scroll_generation = snapshot.generation;
+        ui.navigation.disassembly_scroll_stop_revision = snapshot.stop_revision;
       }
       if (ImGui::BeginPopupContextItem()) {
         draw_instruction_context_actions(snapshot, engine, ui, instruction,
@@ -642,13 +649,13 @@ void draw_disassembly_panel(const debugger::SessionSnapshot &snapshot,
       ImGui::TableSetColumnIndex(2);
       if (const auto target =
               draw_disassembly_text_cell(presentation.instruction, snapshot)) {
-        ui.disassembly_cursor = instruction.address;
+        ui.navigation.disassembly_cursor = instruction.address;
         follow_address(snapshot, engine, ui, *target);
       }
       ImGui::TableSetColumnIndex(3);
       if (const auto target =
               draw_disassembly_text_cell(presentation.annotation, snapshot)) {
-        ui.disassembly_cursor = instruction.address;
+        ui.navigation.disassembly_cursor = instruction.address;
         follow_address(snapshot, engine, ui, *target);
       }
       ImGui::TableSetColumnIndex(4);
@@ -673,7 +680,8 @@ void draw_disassembly_panel(const debugger::SessionSnapshot &snapshot,
 
 void draw_threads_panel(const debugger::SessionSnapshot &snapshot,
                         debugger::LldbEngine &engine, UiState &ui) {
-  if (!begin_optional_panel(l10n::Key::WindowThreads, ui.show_threads))
+  if (!begin_optional_panel(l10n::Key::WindowThreads,
+                            ui.workspace.show_threads))
     return;
   if (begin_detail_table("thread-table", 4)) {
     ImGui::TableSetupColumn(l10n::label(l10n::Key::GuiPanelsIdColumn),
@@ -708,7 +716,8 @@ void draw_threads_panel(const debugger::SessionSnapshot &snapshot,
 
 void draw_backtrace_panel(const debugger::SessionSnapshot &snapshot,
                           debugger::LldbEngine &engine, UiState &ui) {
-  if (!begin_optional_panel(l10n::Key::WindowBacktrace, ui.show_backtrace))
+  if (!begin_optional_panel(l10n::Key::WindowBacktrace,
+                            ui.workspace.show_backtrace))
     return;
   if (begin_detail_table("backtrace-table", 4)) {
     ImGui::TableSetupColumn(l10n::label(l10n::Key::GuiPanelsFrameIndexColumn),
@@ -753,7 +762,8 @@ void draw_backtrace_panel(const debugger::SessionSnapshot &snapshot,
 
 void draw_stack_panel(const debugger::SessionSnapshot &snapshot,
                       debugger::LldbEngine &engine, UiState &ui) {
-  if (!begin_optional_panel(l10n::Key::WindowStackTelescope, ui.show_stack))
+  if (!begin_optional_panel(l10n::Key::WindowStackTelescope,
+                            ui.workspace.show_stack))
     return;
   if (begin_detail_table("stack-table", 3)) {
     ImGui::TableSetupColumn(l10n::label(l10n::Key::GuiPanelsAddressColumn),
@@ -770,7 +780,7 @@ void draw_stack_panel(const debugger::SessionSnapshot &snapshot,
       char address[32]{};
       std::snprintf(address, sizeof(address), "0x%" PRIx64, entry.address);
       if (ImGui::Selectable(address, false)) {
-        follow_memory(engine, ui, entry.address);
+        follow_memory(engine, ui.memory, entry.address);
       }
       ImGui::TableSetColumnIndex(1);
       ImGui::Text("0x%" PRIx64, entry.value);
@@ -790,7 +800,7 @@ void draw_stack_panel(const debugger::SessionSnapshot &snapshot,
 
 void draw_heap_panel(const debugger::SessionSnapshot &snapshot,
                      debugger::LldbEngine &engine, UiState &ui) {
-  if (!begin_optional_panel(l10n::Key::WindowGlibcHeap, ui.show_heap))
+  if (!begin_optional_panel(l10n::Key::WindowGlibcHeap, ui.workspace.show_heap))
     return;
   if (!snapshot.heap_error.empty()) {
     ImGui::TextColored(ImVec4(1.0F, 0.72F, 0.25F, 1.0F), "%s",
@@ -816,7 +826,7 @@ void draw_heap_panel(const debugger::SessionSnapshot &snapshot,
       char address[32]{};
       std::snprintf(address, sizeof(address), "0x%" PRIx64, chunk.address);
       if (ImGui::Selectable(address, false)) {
-        follow_memory(engine, ui, chunk.address);
+        follow_memory(engine, ui.memory, chunk.address);
       }
       ImGui::TableSetColumnIndex(1);
       ImGui::Text("0x%" PRIx64, chunk.size);
@@ -841,7 +851,8 @@ void draw_heap_panel(const debugger::SessionSnapshot &snapshot,
 
 void draw_memory_map_panel(const debugger::SessionSnapshot &snapshot,
                            debugger::LldbEngine &engine, UiState &ui) {
-  if (!begin_optional_panel(l10n::Key::WindowMemoryMap, ui.show_memory_map))
+  if (!begin_optional_panel(l10n::Key::WindowMemoryMap,
+                            ui.workspace.show_memory_map))
     return;
   if (begin_detail_table("memory-map-table", 4)) {
     ImGui::TableSetupColumn(l10n::label(l10n::Key::GuiPanelsStart),
@@ -855,9 +866,9 @@ void draw_memory_map_panel(const debugger::SessionSnapshot &snapshot,
     for (const debugger::MemoryRegionInfo &region : snapshot.memory_regions) {
       ImGui::PushID(static_cast<int>(region.start ^ (region.start >> 32U)));
       ImGui::TableNextRow();
-      const bool selected = ui.memory_map_address &&
-                            *ui.memory_map_address >= region.start &&
-                            *ui.memory_map_address < region.end;
+      const bool selected = ui.navigation.memory_map_address &&
+                            *ui.navigation.memory_map_address >= region.start &&
+                            *ui.navigation.memory_map_address < region.end;
       if (selected) {
         ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
                                ImGui::GetColorU32(ImGuiCol_Header));
@@ -869,9 +880,9 @@ void draw_memory_map_panel(const debugger::SessionSnapshot &snapshot,
                             ImGuiSelectableFlags_SpanAllColumns)) {
         debugger_follow_memory_region(engine, ui, region);
       }
-      if (selected && ui.scroll_memory_map_to_address) {
+      if (selected && ui.navigation.scroll_memory_map_to_address) {
         ImGui::SetScrollHereY(0.5F);
-        ui.scroll_memory_map_to_address = false;
+        ui.navigation.scroll_memory_map_to_address = false;
       }
       ImGui::TableSetColumnIndex(1);
       ImGui::Text("0x%" PRIx64, region.end);
@@ -889,7 +900,8 @@ void draw_memory_map_panel(const debugger::SessionSnapshot &snapshot,
 
 void draw_modules_panel(const debugger::SessionSnapshot &snapshot,
                         debugger::LldbEngine &engine, UiState &ui) {
-  if (!begin_optional_panel(l10n::Key::WindowModules, ui.show_modules))
+  if (!begin_optional_panel(l10n::Key::WindowModules,
+                            ui.workspace.show_modules))
     return;
   if (begin_detail_table("module-table", 4)) {
     ImGui::TableSetupColumn(l10n::label(l10n::Key::GuiPanelsBaseColumn),
@@ -923,7 +935,8 @@ void draw_modules_panel(const debugger::SessionSnapshot &snapshot,
 
 void draw_security_panel(const debugger::SessionSnapshot &snapshot,
                          UiState &ui) {
-  if (!begin_optional_panel(l10n::Key::WindowElfSecurity, ui.show_security))
+  if (!begin_optional_panel(l10n::Key::WindowElfSecurity,
+                            ui.workspace.show_security))
     return;
   if (!snapshot.security.available) {
     ImGui::TextDisabled("%s",
@@ -957,14 +970,14 @@ void draw_security_panel(const debugger::SessionSnapshot &snapshot,
 void draw_register_panel(const debugger::SessionSnapshot &snapshot,
                          debugger::LldbEngine &engine, UiState &ui) {
   ImGui::Begin(l10n::label(l10n::Key::WindowRegisters));
-  debugger_complete_register_write(snapshot, ui);
-  const bool pending = ui.register_write.valid();
+  debugger_complete_register_write(snapshot, ui.registers);
+  const bool pending = ui.registers.write.valid();
   const bool writable =
       snapshot.state == debugger::SessionState::Stopped && !pending;
-  if (!pending && ui.register_edit_revision != snapshot.revision) {
-    ui.register_edit_name.clear();
+  if (!pending && ui.registers.edit_revision != snapshot.revision) {
+    ui.registers.edit_name.clear();
   }
-  draw_error_text(ui.register_edit_error);
+  draw_error_text(ui.registers.edit_error);
   ImGui::TextDisabled("%s", l10n::text(l10n::Key::GuiPanelsRegisterEditHelp));
   if (begin_detail_table("registers", 3)) {
     ImGui::TableSetupColumn(l10n::label(l10n::Key::GuiPanelsRegisterColumn),
@@ -981,35 +994,35 @@ void draw_register_panel(const debugger::SessionSnapshot &snapshot,
                                IM_COL32(110, 75, 20, 180));
       }
       ImGui::TableSetColumnIndex(0);
-      const bool editing = ui.register_edit_name == value.name;
+      const bool editing = ui.registers.edit_name == value.name;
       if (ImGui::Selectable(value.name.c_str(), editing,
                             editing ? ImGuiSelectableFlags_None
                                     : ImGuiSelectableFlags_SpanAllColumns) &&
           writable) {
-        debugger_begin_register_edit(snapshot, ui, value);
+        debugger_begin_register_edit(snapshot, ui.registers, value);
       }
       if (ImGui::BeginPopupContextItem("register-context")) {
         ImGui::BeginDisabled(!writable);
         if (ImGui::MenuItem(
                 l10n::label(l10n::Key::GuiPanelsEditRegisterValue))) {
-          debugger_begin_register_edit(snapshot, ui, value);
+          debugger_begin_register_edit(snapshot, ui.registers, value);
         }
         if (ImGui::MenuItem(l10n::label(l10n::Key::GuiPanelsClear), "0")) {
-          debugger_clear_register(engine, ui, value);
+          debugger_clear_register(engine, ui.registers, value);
         }
         const bool integer = debugger_register_is_integer(value);
         ImGui::BeginDisabled(!integer);
         const auto mask = debugger_register_mask(value, integer);
         if (ImGui::MenuItem(l10n::label(l10n::Key::GuiPanelsDecrement), "-1")) {
-          ui.register_edit_name.clear();
+          ui.registers.edit_name.clear();
           debugger_write_register(
-              engine, ui, value,
+              engine, ui.registers, value,
               address_specification((value.numeric_value - 1) & mask));
         }
         if (ImGui::MenuItem(l10n::label(l10n::Key::GuiPanelsIncrement), "+1")) {
-          ui.register_edit_name.clear();
+          ui.registers.edit_name.clear();
           debugger_write_register(
-              engine, ui, value,
+              engine, ui.registers, value,
               address_specification((value.numeric_value + 1) & mask));
         }
         ImGui::EndDisabled();
@@ -1025,25 +1038,25 @@ void draw_register_panel(const debugger::SessionSnapshot &snapshot,
         ImGui::EndPopup();
       }
       ImGui::TableSetColumnIndex(1);
-      if (ui.register_edit_name == value.name) {
+      if (ui.registers.edit_name == value.name) {
         ImGui::BeginDisabled(!writable);
-        if (ui.register_edit_focus && writable) {
+        if (ui.registers.edit_focus && writable) {
           ImGui::SetKeyboardFocusHere();
-          ui.register_edit_focus = false;
+          ui.registers.edit_focus = false;
         }
         ImGui::SetNextItemWidth(-1.0F);
         const bool submitted =
-            ImGui::InputText("##register-value", ui.register_edit_text.data(),
-                             ui.register_edit_text.size(),
+            ImGui::InputText("##register-value", ui.registers.edit_text.data(),
+                             ui.registers.edit_text.size(),
                              ImGuiInputTextFlags_EnterReturnsTrue |
                                  ImGuiInputTextFlags_AutoSelectAll);
         const bool cancelled =
             ImGui::IsItemActive() && ImGui::IsKeyPressed(ImGuiKey_Escape);
         if (submitted && writable) {
-          debugger_write_register(engine, ui, value,
-                                  ui.register_edit_text.data());
+          debugger_write_register(engine, ui.registers, value,
+                                  ui.registers.edit_text.data());
         } else if (cancelled || (!pending && ImGui::IsItemDeactivated())) {
-          ui.register_edit_name.clear();
+          ui.registers.edit_name.clear();
         }
         ImGui::EndDisabled();
       } else {
@@ -1069,13 +1082,13 @@ void draw_breakpoints_panel(const debugger::SessionSnapshot &snapshot,
   ImGui::Begin(l10n::label(l10n::Key::WindowBreakpoints));
   const bool submitted = ImGui::InputTextWithHint(
       "##breakpoint", l10n::text(l10n::Key::GuiPanelsBreakpointAddressHint),
-      ui.breakpoint_specification.data(), ui.breakpoint_specification.size(),
+      ui.breakpoints.specification.data(), ui.breakpoints.specification.size(),
       ImGuiInputTextFlags_EnterReturnsTrue);
   ImGui::SameLine();
   if (submitted ||
       ImGui::Button(l10n::label(l10n::Key::GuiPanelsAddBreakpoint))) {
-    engine.set_breakpoint(ui.breakpoint_specification.data());
-    ui.breakpoint_specification.front() = '\0';
+    engine.set_breakpoint(ui.breakpoints.specification.data());
+    ui.breakpoints.specification.front() = '\0';
   }
 
   if (begin_detail_table("breakpoint-list", 6)) {
@@ -1139,29 +1152,30 @@ void draw_breakpoints_panel(const debugger::SessionSnapshot &snapshot,
     ImGui::EndTable();
   }
 
-  if (ui.condition_editor_requested) {
+  if (ui.breakpoints.condition_editor_requested) {
     ImGui::OpenPopup(l10n::label(l10n::Key::GuiPanelsConditionalBreakpoint));
-    ui.condition_editor_requested = false;
+    ui.breakpoints.condition_editor_requested = false;
   }
   ImGui::SetNextWindowSize(ImVec2(600.0F, 230.0F), ImGuiCond_Appearing);
   if (ImGui::BeginPopupModal(
           l10n::label(l10n::Key::GuiPanelsConditionalBreakpoint), nullptr,
           ImGuiWindowFlags_NoSavedSettings)) {
-    const bool creating = ui.creating_conditional_breakpoint.has_value();
-    const std::uint32_t breakpoint_id = ui.editing_breakpoint.value_or(0);
+    const bool creating = ui.breakpoints.creating.has_value();
+    const std::uint32_t breakpoint_id = ui.breakpoints.editing.value_or(0);
     if (creating) {
       ImGui::Text(l10n::text(l10n::Key::GuiPanelsNewBreakpointAddress),
-                  *ui.creating_conditional_breakpoint);
+                  *ui.breakpoints.creating);
     } else {
       ImGui::Text(l10n::text(l10n::Key::GuiPanelsBreakpointId), breakpoint_id);
     }
     ImGui::InputTextMultiline(
-        "##script-condition", ui.breakpoint_condition.data(),
-        ui.breakpoint_condition.size(), ImVec2(-1.0F, 130.0F));
-    draw_error_text(ui.breakpoint_condition_error);
+        "##script-condition", ui.breakpoints.condition.data(),
+        ui.breakpoints.condition.size(), ImVec2(-1.0F, 130.0F));
+    draw_error_text(ui.breakpoints.condition_error);
     if (ImGui::Button(creating ? l10n::label(l10n::Key::GuiPanelsCreate)
                                : l10n::label(l10n::Key::GuiPanelsApply))) {
-      if (debugger_apply_condition(engine, ui, creating, breakpoint_id)) {
+      if (debugger_apply_condition(engine, ui.breakpoints, creating,
+                                   breakpoint_id)) {
         ImGui::CloseCurrentPopup();
         close_condition_editor(ui);
       }
@@ -1170,7 +1184,7 @@ void draw_breakpoints_panel(const debugger::SessionSnapshot &snapshot,
       ImGui::SameLine();
       if (ImGui::Button(l10n::label(l10n::Key::GuiPanelsClearCondition))) {
         engine.set_breakpoint_script(breakpoint_id, {});
-        ui.breakpoint_condition.front() = '\0';
+        ui.breakpoints.condition.front() = '\0';
         ImGui::CloseCurrentPopup();
         close_condition_editor(ui);
       }
@@ -1187,7 +1201,7 @@ void draw_breakpoints_panel(const debugger::SessionSnapshot &snapshot,
 
 void draw_scans_panel(const debugger::SessionSnapshot &snapshot,
                       debugger::LldbEngine &engine, UiState &ui) {
-  if (!begin_optional_panel(l10n::Key::WindowScans, ui.show_scans))
+  if (!begin_optional_panel(l10n::Key::WindowScans, ui.workspace.show_scans))
     return;
   if (!ImGui::BeginTabBar("scan-tabs")) {
     ImGui::End();
@@ -1197,24 +1211,25 @@ void draw_scans_panel(const debugger::SessionSnapshot &snapshot,
   if (ImGui::BeginTabItem(l10n::label(l10n::Key::GuiPanelsBinaryStrings))) {
     ImGui::SetNextItemWidth(110.0F);
     ImGui::InputInt(l10n::label(l10n::Key::GuiPanelsMinimumStringLength),
-                    &ui.binary_string_minimum_length);
-    ui.binary_string_minimum_length =
-        std::clamp(ui.binary_string_minimum_length, 1, 4096);
+                    &ui.scans.binary_string_minimum_length);
+    ui.scans.binary_string_minimum_length =
+        std::clamp(ui.scans.binary_string_minimum_length, 1, 4096);
     ImGui::SameLine();
     ImGui::Checkbox(l10n::label(l10n::Key::GuiPanelsIncludeUtf16),
-                    &ui.binary_string_include_utf16);
+                    &ui.scans.binary_string_include_utf16);
     ImGui::SameLine();
     ImGui::BeginDisabled(snapshot.target_path.empty());
     if (ImGui::Button(l10n::label(l10n::Key::GuiPanelsScanBinary))) {
       engine.scan_binary_strings(
-          static_cast<std::uint32_t>(ui.binary_string_minimum_length),
-          ui.binary_string_include_utf16);
+          static_cast<std::uint32_t>(ui.scans.binary_string_minimum_length),
+          ui.scans.binary_string_include_utf16);
     }
     ImGui::EndDisabled();
     ImGui::SetNextItemWidth(-1.0F);
-    ImGui::InputTextWithHint(
-        "##string-filter", l10n::text(l10n::Key::GuiPanelsStringFilterHint),
-        ui.binary_string_filter.data(), ui.binary_string_filter.size());
+    ImGui::InputTextWithHint("##string-filter",
+                             l10n::text(l10n::Key::GuiPanelsStringFilterHint),
+                             ui.scans.binary_string_filter.data(),
+                             ui.scans.binary_string_filter.size());
     if (!snapshot.binary_strings_error.empty()) {
       draw_error_text(snapshot.binary_strings_error);
     } else {
@@ -1237,7 +1252,7 @@ void draw_scans_panel(const debugger::SessionSnapshot &snapshot,
       ImGui::TableSetupColumn(l10n::label(l10n::Key::GuiPanelsStringColumn));
       ImGui::TableSetupScrollFreeze(0, 1);
       ImGui::TableHeadersRow();
-      const std::string_view filter{ui.binary_string_filter.data()};
+      const std::string_view filter{ui.scans.binary_string_filter.data()};
       for (std::size_t index = 0; index < snapshot.binary_strings.size();
            ++index) {
         const debugger::BinaryStringInfo &result =
@@ -1263,7 +1278,7 @@ void draw_scans_panel(const debugger::SessionSnapshot &snapshot,
             ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
             result.has_load_address &&
             snapshot.state == debugger::SessionState::Stopped) {
-          follow_memory(engine, ui, result.load_address);
+          follow_memory(engine, ui.memory, result.load_address);
         }
         if (result.has_load_address && ImGui::BeginPopupContextItem()) {
           ImGui::BeginDisabled(snapshot.state !=
@@ -1296,28 +1311,29 @@ void draw_scans_panel(const debugger::SessionSnapshot &snapshot,
         l10n::text(l10n::Key::GuiPanelsDoubleValueType)};
     const float selector_width =
         std::clamp(ImGui::GetContentRegionAvail().x * 0.40F, 240.0F, 360.0F);
-    int type_index = static_cast<int>(ui.value_scan_type);
+    int type_index = static_cast<int>(ui.scans.value_scan_type);
     ImGui::BeginDisabled(snapshot.value_scan_active);
     ImGui::SetNextItemWidth(selector_width);
     if (ImGui::Combo(l10n::label(l10n::Key::GuiPanelsValueType), &type_index,
                      value_type_names.data(),
                      static_cast<int>(value_type_names.size()))) {
-      ui.value_scan_type = static_cast<debugger::ValueScanType>(type_index);
+      ui.scans.value_scan_type =
+          static_cast<debugger::ValueScanType>(type_index);
     }
     const bool floating_point =
-        ui.value_scan_type == debugger::ValueScanType::Float ||
-        ui.value_scan_type == debugger::ValueScanType::Double;
+        ui.scans.value_scan_type == debugger::ValueScanType::Float ||
+        ui.scans.value_scan_type == debugger::ValueScanType::Double;
     if (floating_point) {
-      ui.value_scan_signed = false;
+      ui.scans.value_scan_signed = false;
     }
     ImGui::SameLine();
     ImGui::BeginDisabled(floating_point);
     ImGui::Checkbox(l10n::label(l10n::Key::GuiPanelsSignedValues),
-                    &ui.value_scan_signed);
+                    &ui.scans.value_scan_signed);
     ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::Checkbox(l10n::label(l10n::Key::GuiPanelsWritableOnly),
-                    &ui.value_scan_writable_only);
+                    &ui.scans.value_scan_writable_only);
     ImGui::EndDisabled();
 
     bool needs_value = true;
@@ -1325,14 +1341,14 @@ void draw_scans_panel(const debugger::SessionSnapshot &snapshot,
       const std::array<const char *, 2> first_scan_names{
           l10n::text(l10n::Key::GuiPanelsExactValue),
           l10n::text(l10n::Key::GuiPanelsUnknownInitialValue)};
-      int first_scan = ui.value_scan_unknown ? 1 : 0;
+      int first_scan = ui.scans.value_scan_unknown ? 1 : 0;
       ImGui::SetNextItemWidth(selector_width);
       if (ImGui::Combo(l10n::label(l10n::Key::GuiPanelsScanType), &first_scan,
                        first_scan_names.data(),
                        static_cast<int>(first_scan_names.size()))) {
-        ui.value_scan_unknown = first_scan == 1;
+        ui.scans.value_scan_unknown = first_scan == 1;
       }
-      needs_value = !ui.value_scan_unknown;
+      needs_value = !ui.scans.value_scan_unknown;
     } else {
       const std::array<const char *, 5> next_scan_names{
           l10n::text(l10n::Key::GuiPanelsExactValue),
@@ -1340,16 +1356,16 @@ void draw_scans_panel(const debugger::SessionSnapshot &snapshot,
           l10n::text(l10n::Key::GuiPanelsUnchangedValue),
           l10n::text(l10n::Key::GuiPanelsIncreasedValue),
           l10n::text(l10n::Key::GuiPanelsDecreasedValue)};
-      int comparison = static_cast<int>(ui.value_scan_comparison);
+      int comparison = static_cast<int>(ui.scans.value_scan_comparison);
       ImGui::SetNextItemWidth(selector_width);
       if (ImGui::Combo(l10n::label(l10n::Key::GuiPanelsScanType), &comparison,
                        next_scan_names.data(),
                        static_cast<int>(next_scan_names.size()))) {
-        ui.value_scan_comparison =
+        ui.scans.value_scan_comparison =
             static_cast<debugger::ValueScanComparison>(comparison);
       }
-      needs_value =
-          ui.value_scan_comparison == debugger::ValueScanComparison::Exact;
+      needs_value = ui.scans.value_scan_comparison ==
+                    debugger::ValueScanComparison::Exact;
     }
 
     ImGui::BeginDisabled(!needs_value);
@@ -1358,7 +1374,7 @@ void draw_scans_panel(const debugger::SessionSnapshot &snapshot,
         "##scan-value",
         needs_value ? l10n::text(l10n::Key::GuiPanelsValueColumn)
                     : l10n::text(l10n::Key::GuiPanelsNoScanValueRequired),
-        ui.value_scan_value.data(), ui.value_scan_value.size(),
+        ui.scans.value_scan_value.data(), ui.scans.value_scan_value.size(),
         ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::EndDisabled();
     ImGui::SameLine();
@@ -1367,14 +1383,15 @@ void draw_scans_panel(const debugger::SessionSnapshot &snapshot,
     if (!snapshot.value_scan_active) {
       if ((submitted && needs_value) ||
           ImGui::Button(l10n::label(l10n::Key::GuiPanelsFirstScan))) {
-        engine.start_value_scan(ui.value_scan_type, ui.value_scan_value.data(),
-                                ui.value_scan_unknown, ui.value_scan_signed,
-                                ui.value_scan_writable_only);
+        engine.start_value_scan(
+            ui.scans.value_scan_type, ui.scans.value_scan_value.data(),
+            ui.scans.value_scan_unknown, ui.scans.value_scan_signed,
+            ui.scans.value_scan_writable_only);
       }
     } else if ((submitted && needs_value) ||
                ImGui::Button(l10n::label(l10n::Key::GuiPanelsNextScan))) {
-      engine.next_value_scan(ui.value_scan_comparison,
-                             ui.value_scan_value.data());
+      engine.next_value_scan(ui.scans.value_scan_comparison,
+                             ui.scans.value_scan_value.data());
     }
     ImGui::EndDisabled();
     if (snapshot.value_scan_active) {
@@ -1423,7 +1440,7 @@ void draw_scans_panel(const debugger::SessionSnapshot &snapshot,
           if (ImGui::Selectable(address, false,
                                 ImGuiSelectableFlags_SpanAllColumns) &&
               ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-            follow_memory(engine, ui, result.address);
+            follow_memory(engine, ui.memory, result.address);
           }
           if (ImGui::BeginPopupContextItem()) {
             ImGui::BeginDisabled(snapshot.state !=

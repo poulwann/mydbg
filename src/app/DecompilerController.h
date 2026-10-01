@@ -1,6 +1,6 @@
 #pragma once
 
-#include "backend/decompiler/DecompilerEngine.h"
+#include "app/DecompilerState.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -16,22 +16,6 @@ struct SessionSnapshot;
 namespace mydbg::app {
 
 struct UiState;
-
-enum class DecompilerDialog {
-  None,
-  Rename,
-  SetType,
-};
-
-struct DecompilerTarget {
-  debugger::DecompilerSymbolKind kind{debugger::DecompilerSymbolKind::None};
-  std::string name;
-  std::string text;
-  std::uint64_t reference_file_address{};
-  bool has_reference_file_address{};
-  std::uint64_t cursor_file_address{};
-  bool has_cursor_file_address{};
-};
 
 struct DecompilerNavigationLink {
   std::size_t character{};

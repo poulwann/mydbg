@@ -79,7 +79,7 @@ void draw_disassembly_graph(const debugger::SessionSnapshot &snapshot,
                             debugger::LldbEngine &engine, UiState &ui,
                             bool control_lease) {
   const bool follow_requested =
-      std::exchange(ui.navigation_follow_requested, false);
+      std::exchange(ui.navigation.follow_requested, false);
   const auto &graph = snapshot.disassembly_graph;
   if (!graph) {
     if (snapshot.state == debugger::SessionState::Stopped) {
@@ -107,24 +107,27 @@ void draw_disassembly_graph(const debugger::SessionSnapshot &snapshot,
     }
     return;
   }
-  if (!ui.disassembly_graph_state) {
-    ui.disassembly_graph_state = std::make_shared<DisassemblyGraphView>();
-    ui.disassembly_graph_state->generation = snapshot.generation;
-    ui.disassembly_graph_state->stop_revision = snapshot.stop_revision;
+  if (!ui.navigation.disassembly_graph_state) {
+    ui.navigation.disassembly_graph_state =
+        std::make_shared<DisassemblyGraphView>();
+    ui.navigation.disassembly_graph_state->generation = snapshot.generation;
+    ui.navigation.disassembly_graph_state->stop_revision =
+        snapshot.stop_revision;
   }
-  auto &view = *ui.disassembly_graph_state;
+  auto &view = *ui.navigation.disassembly_graph_state;
   if (view.layout.graph != graph || view.layout.font != ImGui::GetFont() ||
       view.layout.font_size != ImGui::GetFontSize() ||
       view.layout.architecture != snapshot.architecture) {
     if (!view.pending_center) {
-      view.pending_center = ui.disassembly_cursor;
+      view.pending_center = ui.navigation.disassembly_cursor;
     }
     disassembly_graph_build_layout(view.layout, graph, snapshot.architecture,
                                    ImGui::GetFont(), ImGui::GetFontSize());
   }
-  if (!view.observed_cursor || *view.observed_cursor != ui.disassembly_cursor) {
-    view.pending_center = ui.disassembly_cursor;
-    view.observed_cursor = ui.disassembly_cursor;
+  if (!view.observed_cursor ||
+      *view.observed_cursor != ui.navigation.disassembly_cursor) {
+    view.pending_center = ui.navigation.disassembly_cursor;
+    view.observed_cursor = ui.navigation.disassembly_cursor;
   }
   if (view.generation != snapshot.generation ||
       view.stop_revision != snapshot.stop_revision) {
@@ -132,10 +135,10 @@ void draw_disassembly_graph(const debugger::SessionSnapshot &snapshot,
     view.stop_revision = snapshot.stop_revision;
     view.pending_center = snapshot.pc;
   }
-  if (ui.disassembly_scroll_target &&
-      view.layout.rows.contains(*ui.disassembly_scroll_target)) {
-    view.pending_center = *ui.disassembly_scroll_target;
-    ui.disassembly_scroll_target.reset();
+  if (ui.navigation.disassembly_scroll_target &&
+      view.layout.rows.contains(*ui.navigation.disassembly_scroll_target)) {
+    view.pending_center = *ui.navigation.disassembly_scroll_target;
+    ui.navigation.disassembly_scroll_target.reset();
   }
   const auto &keyboard_io = ImGui::GetIO();
   if (!control_lease && snapshot.state == debugger::SessionState::Stopped &&
@@ -147,23 +150,24 @@ void draw_disassembly_graph(const debugger::SessionSnapshot &snapshot,
     const bool down = ImGui::IsKeyPressed(ImGuiKey_DownArrow);
     if (up || down) {
       const auto next = disassembly_graph_adjacent_address(
-          *graph, ui.disassembly_cursor, up, down);
+          *graph, ui.navigation.disassembly_cursor, up, down);
       if (next) {
-        ui.disassembly_cursor = *next;
+        ui.navigation.disassembly_cursor = *next;
         view.observed_cursor = *next;
         view.pending_center = *next;
       }
     }
   }
   if (follow_requested) {
-    const auto selected = view.layout.rows.find(ui.disassembly_cursor);
+    const auto selected =
+        view.layout.rows.find(ui.navigation.disassembly_cursor);
     if (selected != view.layout.rows.end()) {
       const auto [block, row] = selected->second;
       const auto &instruction = graph->blocks[block].instructions[row];
       const auto target = disassembly_navigation_target(
           snapshot, instruction, view.layout.blocks[block].rows[row].text);
       if (target && follow_address(snapshot, engine, ui, *target) &&
-          ui.disassembly_cursor == *target) {
+          ui.navigation.disassembly_cursor == *target) {
         view.pending_center = *target;
         view.observed_cursor = *target;
       }
@@ -176,9 +180,9 @@ void draw_disassembly_graph(const debugger::SessionSnapshot &snapshot,
       ImGui::Button(l10n::label(l10n::Key::GuiGraphResetZoom));
   ImGui::SameLine();
   if (ImGui::Button(l10n::label(l10n::Key::GuiGraphSelection))) {
-    view.pending_center = ui.disassembly_cursor;
-    if (!view.layout.rows.contains(ui.disassembly_cursor)) {
-      follow_disassembly(engine, ui, ui.disassembly_cursor);
+    view.pending_center = ui.navigation.disassembly_cursor;
+    if (!view.layout.rows.contains(ui.navigation.disassembly_cursor)) {
+      follow_disassembly(engine, ui, ui.navigation.disassembly_cursor);
     }
   }
   ImGui::SameLine();
@@ -345,26 +349,26 @@ void draw_disassembly_graph(const debugger::SessionSnapshot &snapshot,
     view.background_drag =
         hovered_block == no_block && hovered_edge == no_block;
     if (hovered_row != no_block) {
-      ui.disassembly_cursor =
+      ui.navigation.disassembly_cursor =
           graph->blocks[hovered_block].instructions[hovered_row].address;
     }
     if (hovered_target &&
         follow_address(snapshot, engine, ui, *hovered_target)) {
-      if (ui.disassembly_cursor == *hovered_target) {
+      if (ui.navigation.disassembly_cursor == *hovered_target) {
         view.pending_center = *hovered_target;
         view.observed_cursor = *hovered_target;
       }
     } else if (hovered_row != no_block) {
-      ui.disassembly_cursor =
+      ui.navigation.disassembly_cursor =
           graph->blocks[hovered_block].instructions[hovered_row].address;
-      view.observed_cursor = ui.disassembly_cursor;
+      view.observed_cursor = ui.navigation.disassembly_cursor;
       view.pending_center.reset();
     } else if (hovered_edge != no_block) {
       const auto &layout = view.layout.edges[hovered_edge];
       const auto &edge = graph->blocks[layout.source].edges[layout.edge];
       const auto &source = graph->blocks[layout.source].instructions;
       if (!source.empty()) {
-        ui.disassembly_cursor = source.back().address;
+        ui.navigation.disassembly_cursor = source.back().address;
       }
       if (edge.target && follow_address(snapshot, engine, ui, *edge.target)) {
         view.pending_center = *edge.target;
@@ -386,8 +390,8 @@ void draw_disassembly_graph(const debugger::SessionSnapshot &snapshot,
       ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
     view.popup_address =
         graph->blocks[hovered_block].instructions[hovered_row].address;
-    ui.disassembly_cursor = *view.popup_address;
-    view.observed_cursor = ui.disassembly_cursor;
+    ui.navigation.disassembly_cursor = *view.popup_address;
+    view.observed_cursor = ui.navigation.disassembly_cursor;
     ImGui::OpenPopup("graph-instruction-actions");
   }
 
@@ -457,7 +461,7 @@ void draw_disassembly_graph(const debugger::SessionSnapshot &snapshot,
       if (row_end < origin.y || y > origin.y + size.y) {
         continue;
       }
-      if (instruction.address == ui.disassembly_cursor) {
+      if (instruction.address == ui.navigation.disassembly_cursor) {
         draw->AddRectFilled(ImVec2(start.x, y), ImVec2(end.x, row_end),
                             ImGui::GetColorU32(ImGuiCol_HeaderActive, 0.35F));
       } else if (i == hovered_block && r == hovered_row) {

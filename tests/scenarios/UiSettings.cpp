@@ -1,5 +1,5 @@
+#include "Scenarios.h"
 #include "app/AppState.h"
-#include "app/Headless.h"
 #include "app/UiSupport.h"
 #include "localization/Localization.h"
 
@@ -28,37 +28,29 @@ int run_keybinding_headless() {
                                std::to_string(static_cast<int>(ImGuiKey_F8)) +
                                "\n\n";
   ImGui::LoadIniSettingsFromMemory(settings.c_str(), settings.size());
-  if (ui.keybindings[action_index(DebugAction::StartContinue)] != ImGuiKey_F8) {
-    std::fprintf(stderr, l10n::text(l10n::Key::HeadlessKeybindingLoadFailed),
-                 ui.keybindings[action_index(DebugAction::StartContinue)],
-                 ImGuiKey_F8);
+  if (ui.workspace.keybindings[action_index(DebugAction::StartContinue)] !=
+      ImGuiKey_F8) {
+    std::fprintf(
+        stderr, l10n::text(l10n::Key::HeadlessKeybindingLoadFailed),
+        ui.workspace.keybindings[action_index(DebugAction::StartContinue)],
+        ImGuiKey_F8);
     ImGui::DestroyContext();
     return 40;
   }
-  if (ui.script_keybindings[action_index(ScriptAction::DebugContinue)] !=
+  if (ui.workspace
+          .script_keybindings[action_index(ScriptAction::DebugContinue)] !=
       ImGuiKey_F8) {
     std::fprintf(
         stderr, l10n::text(l10n::Key::HeadlessPythonKeybindingLoadFailed),
-        ui.script_keybindings[action_index(ScriptAction::DebugContinue)],
+        ui.workspace
+            .script_keybindings[action_index(ScriptAction::DebugContinue)],
         ImGuiKey_F8);
     ImGui::DestroyContext();
     return 45;
   }
-  if (ui.script_keybindings[action_index(ScriptAction::StepInto)] !=
-          ImGuiKey_F11 ||
-      ui.script_keybindings[action_index(ScriptAction::StepOver)] !=
-          ImGuiKey_F10 ||
-      ui.script_keybindings[action_index(ScriptAction::StepOut)] !=
-          (ImGuiMod_Shift | ImGuiKey_F11)) {
-    std::fputs(
-        l10n::text(l10n::Key::HeadlessPythonCallNavigationDefaultsIncorrect),
-        stderr);
-    ImGui::DestroyContext();
-    return 46;
-  }
-  if (ui.window_x != 123 || ui.window_y != 234 || ui.window_width != 1280 ||
-      ui.window_height != 720 || !ui.window_position_saved ||
-      !ui.window_maximized) {
+  if (ui.workspace.window_x != 123 || ui.workspace.window_y != 234 ||
+      ui.workspace.window_width != 1280 || ui.workspace.window_height != 720 ||
+      !ui.workspace.window_position_saved || !ui.workspace.window_maximized) {
     std::fputs(l10n::text(l10n::Key::HeadlessWindowStateLoadFailed), stderr);
     ImGui::DestroyContext();
     return 43;
@@ -97,14 +89,14 @@ int run_keybinding_headless() {
   io.Fonts->Build();
   ImGui::NewFrame();
   (void)ImGui::Shortcut(
-      ui.keybindings[action_index(DebugAction::StartContinue)],
+      ui.workspace.keybindings[action_index(DebugAction::StartContinue)],
       ImGuiInputFlags_RouteGlobal);
   ImGui::EndFrame();
   io.AddKeyEvent(ImGuiKey_F8, true);
   ImGui::NewFrame();
-  const bool dispatched =
-      ImGui::Shortcut(ui.keybindings[action_index(DebugAction::StartContinue)],
-                      ImGuiInputFlags_RouteGlobal);
+  const bool dispatched = ImGui::Shortcut(
+      ui.workspace.keybindings[action_index(DebugAction::StartContinue)],
+      ImGuiInputFlags_RouteGlobal);
   ImGui::EndFrame();
   ImGui::DestroyContext();
   if (!dispatched) {

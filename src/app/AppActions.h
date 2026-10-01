@@ -22,6 +22,7 @@ class PluginLoader;
 namespace mydbg::app {
 
 struct UiState;
+struct MemoryState;
 enum class DebugAction : std::size_t;
 
 std::string bytes_as_hex(const std::vector<std::uint8_t> &bytes);
@@ -31,7 +32,7 @@ std::optional<std::uint64_t> parse_value(std::string_view text);
 void load_plugins(debugger::plugins::PluginLoader &loader);
 std::optional<std::uint64_t>
 pointer_at(const debugger::SessionSnapshot &snapshot, std::size_t offset);
-void follow_memory(debugger::LldbEngine &engine, UiState &ui,
+void follow_memory(debugger::LldbEngine &engine, MemoryState &memory,
                    std::uint64_t address);
 void follow_disassembly(debugger::LldbEngine &engine, UiState &ui,
                         std::uint64_t address);

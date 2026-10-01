@@ -1,11 +1,13 @@
 #pragma once
 
-#include "backend/lldb/LldbEngine.h"
-
 #include <pybind11/pybind11.h>
 
 #include <atomic>
 #include <memory>
+
+namespace debugger {
+class LldbEngine;
+}
 
 namespace debugger::scripting {
 

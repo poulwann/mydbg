@@ -1,6 +1,6 @@
 #pragma once
 
-#include "backend/lldb/LldbEngine.h"
+#include "backend/DebuggerTypes.h"
 
 #include <imgui.h>
 

@@ -5,6 +5,7 @@
 #include "app/DebuggerPanels.h"
 #include "app/DecompilerController.h"
 #include "app/UiSupport.h"
+#include "backend/lldb/LldbEngine.h"
 #include "localization/Localization.h"
 
 #include <cinttypes>
@@ -58,9 +59,9 @@ const char *decompiler_target_kind_name(debugger::DecompilerSymbolKind kind) {
 void draw_decompiler_edit_dialogs(
     debugger::DecompilerEngine &decompiler, UiState &ui,
     const debugger::DecompilerSnapshot &decompiled, bool enabled) {
-  if (ui.decompiler_dialog == DecompilerDialog::Rename) {
+  if (ui.decompiler.dialog == DecompilerDialog::Rename) {
     ImGui::OpenPopup(l10n::label(l10n::Key::GuiPanelsRenameDecompilerItem));
-  } else if (ui.decompiler_dialog == DecompilerDialog::SetType) {
+  } else if (ui.decompiler.dialog == DecompilerDialog::SetType) {
     ImGui::OpenPopup(l10n::label(l10n::Key::GuiPanelsSetDecompilerType));
   }
 
@@ -70,12 +71,12 @@ void draw_decompiler_edit_dialogs(
     if (!ImGui::BeginPopupModal(l10n::label(title), nullptr,
                                 ImGuiWindowFlags_NoSavedSettings))
       continue;
-    if (!enabled || !ui.decompiler_target) {
-      ui.decompiler_dialog = DecompilerDialog::None;
+    if (!enabled || !ui.decompiler.target) {
+      ui.decompiler.dialog = DecompilerDialog::None;
       ImGui::CloseCurrentPopup();
     }
     const DecompilerTarget *target =
-        ui.decompiler_target ? &*ui.decompiler_target : nullptr;
+        ui.decompiler.target ? &*ui.decompiler.target : nullptr;
     ImGui::Text(l10n::text(l10n::Key::GuiPanelsDecompilerTarget),
                 target ? decompiler_target_kind_name(target->kind)
                        : l10n::text(l10n::Key::GuiPanelsDecompilerToken),
@@ -83,28 +84,28 @@ void draw_decompiler_edit_dialogs(
     if (!rename)
       ImGui::TextDisabled("%s",
                           l10n::text(l10n::Key::GuiPanelsDecompilerTypeHelp));
-    const auto text = rename ? std::span<char>{ui.decompiler_name_text}
-                             : std::span<char>{ui.decompiler_type_text};
+    const auto text = rename ? std::span<char>{ui.decompiler.name_text}
+                             : std::span<char>{ui.decompiler.type_text};
     const bool submitted =
         ImGui::InputText(l10n::label(rename ? l10n::Key::GuiPanelsName
                                             : l10n::Key::GuiPanelsType),
                          text.data(), text.size(),
                          ImGuiInputTextFlags_EnterReturnsTrue |
                              ImGuiInputTextFlags_AutoSelectAll);
-    draw_error_text(ui.decompiler_message);
+    draw_error_text(ui.decompiler.message);
     if ((submitted || ImGui::Button(l10n::label(l10n::Key::GuiPanelsApply))) &&
         enabled && target != nullptr) {
       const bool applied = decompiler_apply_edit(decompiler, ui, decompiled,
                                                  *target, rename, text.data());
       if (applied) {
-        ui.decompiler_dialog = DecompilerDialog::None;
+        ui.decompiler.dialog = DecompilerDialog::None;
         ImGui::CloseCurrentPopup();
       }
     }
     ImGui::SameLine();
     if (ImGui::Button(l10n::label(l10n::Key::GuiPanelsCancel)) ||
         ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-      ui.decompiler_dialog = DecompilerDialog::None;
+      ui.decompiler.dialog = DecompilerDialog::None;
       ImGui::CloseCurrentPopup();
     }
     ImGui::EndPopup();
@@ -122,7 +123,7 @@ void draw_decompiler_panel(
       decompiler_content_ready(snapshot, *decompiled, ui, control_lease);
   dispatch_navigation_shortcuts(snapshot, engine, ui, true, control_lease);
   const bool follow_requested =
-      std::exchange(ui.navigation_follow_requested, false);
+      std::exchange(ui.navigation.follow_requested, false);
   if (decompiled->loading) {
     ImGui::TextDisabled("%s",
                         l10n::text(l10n::Key::GuiPanelsDecompilerLoading));
@@ -138,8 +139,8 @@ void draw_decompiler_panel(
     ImGui::SameLine();
     ImGui::TextDisabled("%s", decompiled->notice.c_str());
   }
-  if (!ui.decompiler_message.empty()) {
-    ImGui::TextDisabled("%s", ui.decompiler_message.c_str());
+  if (!ui.decompiler.message.empty()) {
+    ImGui::TextDisabled("%s", ui.decompiler.message.c_str());
   }
   ImGui::TextDisabled("%s",
                       l10n::text(l10n::Key::GuiPanelsDecompilerNavigationHelp));
@@ -165,7 +166,7 @@ void draw_decompiler_panel(
       !io.KeyAlt && !io.KeySuper;
   bool keyboard_scrolled = false;
   std::optional<DecompilerNavigationLink> keyboard_target;
-  if (ui.decompiler_keyboard_line) {
+  if (ui.decompiler.keyboard_line) {
     if (keyboard_navigation) {
       const bool up = ImGui::IsKeyPressed(ImGuiKey_UpArrow);
       const bool down = ImGui::IsKeyPressed(ImGuiKey_DownArrow);
@@ -187,7 +188,7 @@ void draw_decompiler_panel(
   bool navigated = false;
   for (std::size_t index = 0; index < decompiled->lines.size(); ++index) {
     const debugger::DecompiledLine &line = decompiled->lines[index];
-    const bool selected = ui.decompiler_keyboard_line == index;
+    const bool selected = ui.decompiler.keyboard_line == index;
     const bool program_counter =
         program_counter_line && *program_counter_line == index;
 
@@ -203,10 +204,10 @@ void draw_decompiler_panel(
     if (program_counter && !selected) {
       draw_list->AddRectFilled(item_min, item_max, IM_COL32(100, 100, 20, 110));
     }
-    const bool line_marked = ui.decompiler_selection_start &&
-                             ui.decompiler_selection_end &&
-                             index >= *ui.decompiler_selection_start &&
-                             index <= *ui.decompiler_selection_end;
+    const bool line_marked = ui.decompiler.selection_start &&
+                             ui.decompiler.selection_end &&
+                             index >= *ui.decompiler.selection_start &&
+                             index <= *ui.decompiler.selection_end;
     if (line_marked) {
       draw_list->AddRectFilled(item_min, item_max, IM_COL32(70, 110, 170, 95));
     }
@@ -285,7 +286,7 @@ void draw_decompiler_panel(
         decompiler_begin_selection(snapshot, *decompiled, ui, line, index,
                                    hovered.file_address);
       } else if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) &&
-                 ui.decompiler_selection_anchor) {
+                 ui.decompiler.selection_anchor) {
         decompiler_extend_selection(ui, index);
       }
     }
@@ -295,26 +296,26 @@ void draw_decompiler_panel(
 
     if (!navigated && selected &&
         (keyboard_scrolled ||
-         (selected_file && ui.decompiler_scroll_selection != *selected_file))) {
+         (selected_file && ui.decompiler.scroll_selection != *selected_file))) {
       ImGui::SetScrollHereY(0.5F);
       if (selected_file)
-        ui.decompiler_scroll_selection = *selected_file;
+        ui.decompiler.scroll_selection = *selected_file;
     }
     if (ImGui::BeginPopupContextItem("decompiler-context")) {
-      if (ui.decompiler_selection_start && ui.decompiler_selection_end) {
+      if (ui.decompiler.selection_start && ui.decompiler.selection_end) {
         if (ImGui::MenuItem(
                 l10n::label(l10n::Key::GuiPanelsCopyDecompilerLines),
                 "Ctrl+C")) {
           const std::string text = selected_decompiler_text(
-              decompiled->lines, *ui.decompiler_selection_start,
-              *ui.decompiler_selection_end);
+              decompiled->lines, *ui.decompiler.selection_start,
+              *ui.decompiler.selection_end);
           ImGui::SetClipboardText(text.c_str());
         }
         ImGui::Separator();
       }
       ImGui::BeginDisabled(!content_ready);
-      const DecompilerTarget *target = ui.decompiler_context_target
-                                           ? &*ui.decompiler_context_target
+      const DecompilerTarget *target = ui.decompiler.context_target
+                                           ? &*ui.decompiler.context_target
                                            : nullptr;
       if (target != nullptr &&
           target->kind != debugger::DecompilerSymbolKind::None) {
@@ -357,7 +358,7 @@ void draw_decompiler_panel(
         ImGui::Separator();
       }
       const std::optional<std::uint64_t> context_load_address =
-          ui.decompiler_context_load_address;
+          ui.decompiler.context_load_address;
       if (!context_load_address) {
         ImGui::TextDisabled(
             "%s", l10n::text(l10n::Key::GuiPanelsCursorAddressUnavailable));
@@ -371,9 +372,9 @@ void draw_decompiler_panel(
         if (ImGui::MenuItem(l10n::label(l10n::Key::GuiPanelsShowDisassembly))) {
           decompiler_select_source(
               snapshot, *decompiled, ui, line,
-              ui.decompiler_context_target &&
-                      ui.decompiler_context_target->has_cursor_file_address
-                  ? std::optional{ui.decompiler_context_target
+              ui.decompiler.context_target &&
+                      ui.decompiler.context_target->has_cursor_file_address
+                  ? std::optional{ui.decompiler.context_target
                                       ->cursor_file_address}
                   : std::nullopt);
           follow_disassembly(engine, ui, load_address);
@@ -387,12 +388,12 @@ void draw_decompiler_panel(
                              snapshot.state != debugger::SessionState::Stopped);
         if (ImGui::MenuItem(l10n::label(l10n::Key::GuiPanelsRunToCursor),
                             "F4")) {
-          ui.disassembly_cursor = load_address;
+          ui.navigation.disassembly_cursor = load_address;
           engine.run_to_address(load_address);
         }
         ImGui::EndDisabled();
         if (ImGui::MenuItem(l10n::label(l10n::Key::GuiPanelsFollowMemory)))
-          follow_memory(engine, ui, load_address);
+          follow_memory(engine, ui.memory, load_address);
         if (ImGui::MenuItem(l10n::label(l10n::Key::GuiPanelsShowMemoryMap)))
           show_in_memory_map(ui, load_address);
       }
@@ -402,10 +403,10 @@ void draw_decompiler_panel(
     ImGui::PopID();
   }
   if (follow_requested && !navigated && keyboard_target &&
-      ui.decompiler_keyboard_line) {
+      ui.decompiler.keyboard_line) {
     decompiler_select_source(
         snapshot, *decompiled, ui,
-        decompiled->lines[*ui.decompiler_keyboard_line],
+        decompiled->lines[*ui.decompiler.keyboard_line],
         keyboard_target->span->has_file_address
             ? std::optional{keyboard_target->span->file_address}
             : std::nullopt);
@@ -413,15 +414,15 @@ void draw_decompiler_panel(
   }
   if (decompiler_focused && !ImGui::GetIO().WantTextInput &&
       ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C) &&
-      ui.decompiler_selection_start && ui.decompiler_selection_end) {
+      ui.decompiler.selection_start && ui.decompiler.selection_end) {
     const std::string text = selected_decompiler_text(
-        decompiled->lines, *ui.decompiler_selection_start,
-        *ui.decompiler_selection_end);
+        decompiled->lines, *ui.decompiler.selection_start,
+        *ui.decompiler.selection_end);
     ImGui::SetClipboardText(text.c_str());
   }
   if (content_ready && decompiler_focused && !ImGui::GetIO().WantTextInput &&
-      ui.decompiler_target) {
-    const DecompilerTarget &target = *ui.decompiler_target;
+      ui.decompiler.target) {
+    const DecompilerTarget &target = *ui.decompiler.target;
     if (ImGui::IsKeyPressed(ImGuiKey_N) &&
         decompiler_target_renamable(target)) {
       open_decompiler_dialog(ui, DecompilerDialog::Rename, target, target.name);

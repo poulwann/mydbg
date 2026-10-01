@@ -273,27 +273,49 @@ ctest --preset dev
 
 The suite covers catalog validation and translation-independent command status, the condition language, LLDB commands, launching and attaching, remote GDB-protocol sessions, QEMU cross-architecture fixtures, heap and value scanning, stop intelligence, Python/LLDB coexistence, scripting, plugins, and the headless CTF example.
 
+For a native-only development build without QEMU/cross-compilation requirements or optional symbolic scenarios:
+
+```console
+cmake --preset native-dev
+cmake --build --preset native-dev
+ctest --preset native-dev
+```
+
+The `dev` preset retains the full suite. `MYDBG_CROSS_ARCH_TESTS` and `MYDBG_SYMBOLIC_TESTS` independently control the optional groups. CTest labels are `unit`, `native`, `dwarf`, `python`, `cross`, and `symbolic`; for example, `ctest --preset dev -L unit`. Symbolic tests still require the dependencies described above. Every CTest command runs with temporary home, configuration, cache, and session directories.
+
+Fixed developer scenarios live in the test-only `mydbg_scenarios` executable. Use CTest for fixture arguments and isolation. The production executable retains `mydbg --headless-script FILE` for real automation; it no longer dispatches the diagnostic `--headless-*` modes.
+
 ## Project layout
 
 ```text
-src/app/                 GUI, panels, headless runners, and application startup
-src/backend/lldb/        LLDB worker, snapshots, scans, and backend utilities
+cmake/                   Dependency, resource, and GUI-library build setup
+src/app/                 GUI, feature state/controllers, and application startup
+src/backend/DebuggerTypes.h  Provider-independent command and snapshot models
+src/backend/lldb/        Worker orchestration, capture, command handlers, QEMU ownership
 src/backend/decompiler/  Rizin/rz-ghidra decompiler worker
 src/backend/conditions/  Conditional-breakpoint parser and evaluator
-src/scripting/           Embedded Python host, runtime, and bindings
-src/plugins/             Native plugin API and loader
-src/localization/         Catalog loading, validation, and checked lookup API
+src/scripting/           Python host/runtime, debugger adapter, and binding registration
+src/plugins/             Native plugin API and loader, independently built
+src/localization/        Catalog loading, generation, validation, and checked lookup API
 locales/en/               English runtime text and descriptive localization keys
 python/mydbg/             Python-facing support package
 docs/manual/             Built-in user manual
 mydbg_default.ini        Compile-time baseline workspace layout
 tests/                   Unit, integration, debuggee, plugin, and script fixtures
+tests/scenarios/         Standalone debugger and UI-settings diagnostic runner
+tests/cmake/             Fixture setup and labeled test suites
 examples/                 Example ELF targets and Python automation
 ```
 
 The repository-root `mydbg_default.ini` is compiled into the executable as its first-launch baseline. Runtime UI changes are written to `mydbg.ini` beside the executable and override that baseline on subsequent launches.
 
 The GUI and debugger communicate through copied snapshots. LLDB objects remain on the debugger worker thread; the UI consumes immutable application-level state. This separation keeps GUI rendering independent from process-control operations.
+
+`LldbEngine` owns the worker queue, LLDB session, and snapshot publication. Worker-confined helpers own subprocess handling, instruction capture, remote-architecture handling, and native command families. Shared models do not include LLDB or GUI headers; command completion, process generation, and stop revision semantics remain unchanged.
+
+`AppState` composes feature-owned state rather than containing every panel's fields directly. Memory and scripting controllers accept their feature state, and the Python editor implementation stays out of common state headers. Python bindings register the public API separately from the debugger adapter and execution lifecycle. Native plugins retain ABI version 2 and process-lifetime callback residency; this is not a hot-unload API.
+
+Build targets and source lists live beside their owners. The root CMake file composes them; production startup does not link the diagnostic scenario implementations. `.clang-format` defines the C++ formatting convention.
 
 ## Further documentation
 

@@ -1,13 +1,9 @@
 #pragma once
 
-#include "backend/lldb/LldbEngine.h"
-#include "backend/conditions/BreakpointCondition.h"
-#include "plugins/PluginApi.h"
+#include "backend/DebuggerTypes.h"
 
 #include <elf.h>
 #include <lldb/API/LLDB.h>
-#include <rz_analysis.h>
-#include <rz_asm.h>
 
 #include <algorithm>
 #include <array>
@@ -33,7 +29,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
-
 
 namespace debugger::lldb_detail {
 
@@ -68,8 +63,7 @@ std::string lowercase(std::string_view text);
 std::optional<std::uint64_t> parse_integer(std::string_view text);
 std::vector<std::string> split_arguments(std::string_view text);
 std::string cyclic_pattern(std::size_t length);
-std::optional<std::vector<std::uint8_t>>
-parse_hex_bytes(std::string_view text);
+std::optional<std::vector<std::uint8_t>> parse_hex_bytes(std::string_view text);
 std::optional<std::vector<std::uint8_t>>
 assemble_intel_instruction(std::string_view instruction, std::uint64_t address,
                            std::string_view architecture,
@@ -84,12 +78,12 @@ ElfSecurityInfo inspect_elf_security(const std::filesystem::path &path);
 
 std::optional<BinaryImage> read_binary_image(const std::filesystem::path &path,
                                              std::string &error);
-std::optional<std::uint64_t>
-file_address_for_offset(const BinaryImage &image, std::uint64_t file_offset);
+std::optional<std::uint64_t> file_address_for_offset(const BinaryImage &image,
+                                                     std::uint64_t file_offset);
 bool is_binary_string_character(std::uint8_t value);
-std::vector<BinaryStringInfo> extract_binary_strings(
-    const BinaryImage &image, std::size_t minimum_length, bool include_utf16,
-    std::size_t &total, bool &truncated);
+std::vector<BinaryStringInfo>
+extract_binary_strings(const BinaryImage &image, std::size_t minimum_length,
+                       bool include_utf16, std::size_t &total, bool &truncated);
 std::size_t value_scan_width(ValueScanType type);
 std::uint64_t decode_scan_unsigned(const ScanValueBytes &bytes,
                                    std::size_t width, bool big_endian);
@@ -111,19 +105,7 @@ const MemoryRegionInfo *region_containing(const SessionSnapshot &state,
                                           std::uint64_t address);
 std::string permission_text(const MemoryRegionInfo &region);
 std::string register_value_text(lldb::SBValue value);
-std::optional<std::uint64_t>
-register_value_as_unsigned(lldb::SBValue value);
-std::optional<std::vector<std::uint8_t>>
-parse_remote_packet_bytes(std::string_view response);
-bool is_frameless_qemu_mips_stop(lldb::SBProcess &process,
-                                  const SessionSnapshot &state);
-std::optional<std::uint64_t> read_frameless_qemu_mips_register(
-    lldb::SBTarget &target, const SessionSnapshot &state,
-    std::string_view register_name, std::string &failure);
-bool write_frameless_qemu_mips_register(
-    lldb::SBTarget &target, const SessionSnapshot &state,
-    std::string_view register_name, std::uint64_t value,
-    std::string &failure);
+std::optional<std::uint64_t> register_value_as_unsigned(lldb::SBValue value);
 
 struct ElfSymbol {
   std::string name;
@@ -148,6 +130,10 @@ std::optional<lldb::addr_t> resolve_address(std::string_view expression,
                                             std::string &failure);
 bool append_process_output(lldb::SBProcess &process, SessionSnapshot &state);
 std::string module_path(const lldb::SBModule &module);
+std::string debug_file_path(lldb::SBFileSpec file);
+std::string symbol_for_address(lldb::SBTarget &target,
+                               lldb::addr_t load_address,
+                               lldb::SBSymbolContext symbols);
 std::string symbol_for_address(lldb::SBTarget &target,
                                lldb::addr_t load_address);
 lldb::addr_t section_end(lldb::SBSection section, lldb::SBTarget &target);
@@ -164,20 +150,14 @@ std::optional<std::uint64_t> register_numeric(const SessionSnapshot &state,
 std::vector<PointerChainEntry>
 resolve_pointer_chain(lldb::SBTarget &target, lldb::SBProcess &process,
                       const SessionSnapshot &state, std::uint64_t start,
-                      std::size_t maximum_depth);
+                      std::size_t maximum_depth = 3);
 void capture_stack(lldb::SBTarget &target, lldb::SBProcess &process,
                    SessionSnapshot &state);
-void capture_instructions(lldb::SBTarget &target, lldb::addr_t start_address,
-                          SessionSnapshot &state);
-void capture_disassembly_graph(lldb::SBTarget &target,
-                               lldb::addr_t requested_address,
-                               SessionSnapshot &state);
 std::optional<std::uint64_t> fault_address_from_stop(std::string_view text);
 void find_cyclic_matches(lldb::SBTarget &target, lldb::SBProcess &process,
                          const SessionSnapshot &state, CrashInfo &crash);
 void capture_crash(lldb::SBTarget &target, lldb::SBProcess &process,
                    lldb::SBThread &thread, SessionSnapshot &state);
-bool step_frameless_qemu_mips(lldb::SBTarget &target, std::string &failure);
 void record_stop_history(SessionSnapshot &state);
 void capture_stop(lldb::SBTarget &target, lldb::SBProcess &process,
                   std::optional<lldb::addr_t> memory_view_address,

@@ -1,6 +1,7 @@
 #include "app/AppActions.h"
 #include "app/AppState.h"
 #include "app/DisassemblyText.h"
+#include "backend/lldb/LldbEngine.h"
 #include "plugins/PluginApi.h"
 
 #include <algorithm>
@@ -131,73 +132,73 @@ pointer_at(const debugger::SessionSnapshot &snapshot, std::size_t offset) {
   return value;
 }
 
-void follow_memory(debugger::LldbEngine &engine, UiState &ui,
+void follow_memory(debugger::LldbEngine &engine, MemoryState &memory,
                    std::uint64_t address) {
-  std::snprintf(ui.memory_address.data(), ui.memory_address.size(),
-                "0x%" PRIx64, address);
+  std::snprintf(memory.address.data(), memory.address.size(), "0x%" PRIx64,
+                address);
   engine.read_memory(address);
 }
 static NavigationLocation current_navigation_location(const UiState &ui) {
-  if (ui.navigation_source_restore &&
-      ui.navigation_source_restore->address == ui.disassembly_cursor) {
-    return *ui.navigation_source_restore;
+  if (ui.navigation.source_restore && ui.navigation.source_restore->address ==
+                                          ui.navigation.disassembly_cursor) {
+    return *ui.navigation.source_restore;
   }
-  NavigationLocation location{.address = ui.disassembly_cursor};
-  if (ui.decompiler_keyboard_cursor == ui.disassembly_cursor) {
-    location.decompiler_function = ui.decompiler_keyboard_function;
-    location.decompiler_line = ui.decompiler_keyboard_line;
-    location.decompiler_span = ui.decompiler_keyboard_span;
+  NavigationLocation location{.address = ui.navigation.disassembly_cursor};
+  if (ui.decompiler.keyboard_cursor == ui.navigation.disassembly_cursor) {
+    location.decompiler_function = ui.decompiler.keyboard_function;
+    location.decompiler_line = ui.decompiler.keyboard_line;
+    location.decompiler_span = ui.decompiler.keyboard_span;
   }
   return location;
 }
 
 static void apply_disassembly_navigation(debugger::LldbEngine &engine,
                                          UiState &ui, std::uint64_t address) {
-  ui.disassembly_cursor = address;
-  ui.disassembly_scroll_target = address;
-  ui.navigation_source_restore.reset();
-  ui.decompiler_scroll_selection = std::numeric_limits<std::uint64_t>::max();
-  ui.decompiler_keyboard_line.reset();
-  ui.decompiler_keyboard_span.reset();
-  ui.decompiler_keyboard_cursor = address;
+  ui.navigation.disassembly_cursor = address;
+  ui.navigation.disassembly_scroll_target = address;
+  ui.navigation.source_restore.reset();
+  ui.decompiler.scroll_selection = std::numeric_limits<std::uint64_t>::max();
+  ui.decompiler.keyboard_line.reset();
+  ui.decompiler.keyboard_span.reset();
+  ui.decompiler.keyboard_cursor = address;
   engine.read_instructions(address);
 }
 
 void reset_navigation_history(UiState &ui) {
-  ui.navigation_history_size = 0;
-  ui.navigation_history_index = 0;
-  ui.navigation_source_restore.reset();
-  ui.navigation_follow_requested = false;
-  ui.navigation_dispatch_frame = -1;
-  ui.navigation_dialog_requested = false;
-  ui.navigation_dialog_open = false;
-  ui.navigation_address_error.clear();
-  ui.decompiler_keyboard_line.reset();
-  ui.decompiler_keyboard_span.reset();
-  ui.decompiler_keyboard_function.reset();
-  ui.decompiler_keyboard_cursor = 0;
+  ui.navigation.history_size = 0;
+  ui.navigation.history_index = 0;
+  ui.navigation.source_restore.reset();
+  ui.navigation.follow_requested = false;
+  ui.navigation.dispatch_frame = -1;
+  ui.navigation.dialog_requested = false;
+  ui.navigation.dialog_open = false;
+  ui.navigation.address_error.clear();
+  ui.decompiler.keyboard_line.reset();
+  ui.decompiler.keyboard_span.reset();
+  ui.decompiler.keyboard_function.reset();
+  ui.decompiler.keyboard_cursor = 0;
 }
 
 void follow_disassembly(debugger::LldbEngine &engine, UiState &ui,
                         std::uint64_t address) {
-  if (address != ui.disassembly_cursor) {
-    if (ui.navigation_history_size != 0) {
+  if (address != ui.navigation.disassembly_cursor) {
+    if (ui.navigation.history_size != 0) {
       // Selection moves are not jumps, but the row actually left is the
       // location to restore, rather than the original entry into this view.
-      ui.navigation_history[ui.navigation_history_index] =
+      ui.navigation.history[ui.navigation.history_index] =
           current_navigation_location(ui);
-      ui.navigation_history_size = ui.navigation_history_index + 1;
-    } else if (ui.disassembly_cursor != 0) {
-      ui.navigation_history[ui.navigation_history_size++] =
+      ui.navigation.history_size = ui.navigation.history_index + 1;
+    } else if (ui.navigation.disassembly_cursor != 0) {
+      ui.navigation.history[ui.navigation.history_size++] =
           current_navigation_location(ui);
     }
-    if (ui.navigation_history_size == ui.navigation_history.size()) {
-      std::move(ui.navigation_history.begin() + 1, ui.navigation_history.end(),
-                ui.navigation_history.begin());
-      --ui.navigation_history_size;
+    if (ui.navigation.history_size == ui.navigation.history.size()) {
+      std::move(ui.navigation.history.begin() + 1, ui.navigation.history.end(),
+                ui.navigation.history.begin());
+      --ui.navigation.history_size;
     }
-    ui.navigation_history[ui.navigation_history_size++] = {.address = address};
-    ui.navigation_history_index = ui.navigation_history_size - 1;
+    ui.navigation.history[ui.navigation.history_size++] = {.address = address};
+    ui.navigation.history_index = ui.navigation.history_size - 1;
   }
   apply_disassembly_navigation(engine, ui, address);
 }
@@ -206,17 +207,17 @@ void app_traverse_navigation_history(const debugger::SessionSnapshot &snapshot,
                                      debugger::LldbEngine &engine, UiState &ui,
                                      bool forward) {
   if (snapshot.state != debugger::SessionState::Stopped ||
-      ui.navigation_history_size == 0) {
+      ui.navigation.history_size == 0) {
     return;
   }
-  ui.navigation_history[ui.navigation_history_index] =
+  ui.navigation.history[ui.navigation.history_index] =
       current_navigation_location(ui);
-  std::size_t candidate = ui.navigation_history_index;
-  while (forward ? candidate + 1 < ui.navigation_history_size : candidate > 0) {
+  std::size_t candidate = ui.navigation.history_index;
+  while (forward ? candidate + 1 < ui.navigation.history_size : candidate > 0) {
     candidate = forward ? candidate + 1 : candidate - 1;
-    const auto &location = ui.navigation_history[candidate];
+    const auto &location = ui.navigation.history[candidate];
     const std::uint64_t address = location.address;
-    if (address == ui.disassembly_cursor ||
+    if (address == ui.navigation.disassembly_cursor ||
         !std::any_of(snapshot.memory_regions.begin(),
                      snapshot.memory_regions.end(),
                      [address](const auto &region) {
@@ -225,10 +226,10 @@ void app_traverse_navigation_history(const debugger::SessionSnapshot &snapshot,
                      })) {
       continue;
     }
-    ui.navigation_history_index = candidate;
+    ui.navigation.history_index = candidate;
     apply_disassembly_navigation(engine, ui, address);
     if (location.decompiler_function && location.decompiler_line) {
-      ui.navigation_source_restore = location;
+      ui.navigation.source_restore = location;
     }
     return;
   }
@@ -250,39 +251,39 @@ app_follow_address(const debugger::SessionSnapshot &snapshot,
     follow_disassembly(engine, ui, address);
     return AppNavigationTarget::Disassembly;
   } else {
-    follow_memory(engine, ui, address);
+    follow_memory(engine, ui.memory, address);
     return AppNavigationTarget::Memory;
   }
 }
 
 void app_request_navigation_dialog(const debugger::SessionSnapshot &snapshot,
                                    UiState &ui, bool decompiler_view) {
-  ui.navigation_dialog_requested = true;
-  ui.navigation_dialog_decompiler_view = decompiler_view;
-  ui.navigation_dialog_generation = snapshot.generation;
-  ui.navigation_address_error.clear();
-  std::snprintf(ui.navigation_address.data(), ui.navigation_address.size(),
-                "0x%" PRIx64, ui.disassembly_cursor);
+  ui.navigation.dialog_requested = true;
+  ui.navigation.dialog_decompiler_view = decompiler_view;
+  ui.navigation.dialog_generation = snapshot.generation;
+  ui.navigation.address_error.clear();
+  std::snprintf(ui.navigation.address.data(), ui.navigation.address.size(),
+                "0x%" PRIx64, ui.navigation.disassembly_cursor);
 }
 
 void app_toggle_navigation_graph(UiState &ui) {
-  ui.disassembly_graph_view = !ui.disassembly_graph_view;
-  if (!ui.disassembly_graph_view) {
-    ui.disassembly_graph_state.reset();
+  ui.navigation.disassembly_graph_view = !ui.navigation.disassembly_graph_view;
+  if (!ui.navigation.disassembly_graph_view) {
+    ui.navigation.disassembly_graph_state.reset();
   }
-  ui.disassembly_scroll_target = ui.disassembly_cursor;
+  ui.navigation.disassembly_scroll_target = ui.navigation.disassembly_cursor;
 }
 
 bool app_navigation_session_valid(const debugger::SessionSnapshot &snapshot,
                                   const UiState &ui) {
   return snapshot.state == debugger::SessionState::Stopped &&
-         !ui.navigation_control_locked;
+         !ui.navigation.control_locked;
 }
 
 AppNavigationResult
 app_submit_navigation_address(const debugger::SessionSnapshot &snapshot,
                               debugger::LldbEngine &engine, UiState &ui) {
-  std::string_view input{ui.navigation_address.data()};
+  std::string_view input{ui.navigation.address.data()};
   if (input.starts_with("0x") || input.starts_with("0X")) {
     input.remove_prefix(2);
   }
@@ -291,14 +292,14 @@ app_submit_navigation_address(const debugger::SessionSnapshot &snapshot,
       std::from_chars(input.data(), input.data() + input.size(), address, 16);
   if (input.empty() || error != std::errc{} ||
       end != input.data() + input.size()) {
-    ui.navigation_address_error =
+    ui.navigation.address_error =
         l10n::text(l10n::Key::GuiSupportNavigationInvalidAddress);
     return {};
   }
   const AppNavigationTarget target =
       app_follow_address(snapshot, engine, ui, address);
   if (target == AppNavigationTarget::None) {
-    ui.navigation_address_error =
+    ui.navigation.address_error =
         l10n::text(l10n::Key::GuiSupportNavigationUnmappedAddress);
   }
   return {target, address};
@@ -315,9 +316,9 @@ bool app_navigation_address_is_code(const debugger::SessionSnapshot &snapshot,
 }
 
 void show_in_memory_map(UiState &ui, std::uint64_t address) {
-  ui.show_memory_map = true;
-  ui.memory_map_address = address;
-  ui.scroll_memory_map_to_address = true;
+  ui.workspace.show_memory_map = true;
+  ui.navigation.memory_map_address = address;
+  ui.navigation.scroll_memory_map_to_address = true;
 }
 
 std::string address_specification(std::uint64_t address) {
@@ -340,36 +341,37 @@ breakpoint_info_at(const debugger::SessionSnapshot &snapshot,
 }
 
 void request_new_condition_editor(UiState &ui, std::uint64_t address) {
-  ui.editing_breakpoint.reset();
-  ui.creating_conditional_breakpoint = address;
-  ui.breakpoint_condition.front() = '\0';
-  ui.breakpoint_condition_error.clear();
-  ui.condition_editor_requested = true;
+  ui.breakpoints.editing.reset();
+  ui.breakpoints.creating = address;
+  ui.breakpoints.condition.front() = '\0';
+  ui.breakpoints.condition_error.clear();
+  ui.breakpoints.condition_editor_requested = true;
 }
 
 void request_existing_condition_editor(
     UiState &ui, const debugger::BreakpointInfo &breakpoint) {
-  ui.editing_breakpoint = breakpoint.id;
-  ui.creating_conditional_breakpoint.reset();
-  std::snprintf(ui.breakpoint_condition.data(), ui.breakpoint_condition.size(),
-                "%s", breakpoint.script_condition.c_str());
-  ui.breakpoint_condition_error.clear();
-  ui.condition_editor_requested = true;
+  ui.breakpoints.editing = breakpoint.id;
+  ui.breakpoints.creating.reset();
+  std::snprintf(ui.breakpoints.condition.data(),
+                ui.breakpoints.condition.size(), "%s",
+                breakpoint.script_condition.c_str());
+  ui.breakpoints.condition_error.clear();
+  ui.breakpoints.condition_editor_requested = true;
 }
 
 void close_condition_editor(UiState &ui) {
-  ui.editing_breakpoint.reset();
-  ui.creating_conditional_breakpoint.reset();
-  ui.breakpoint_condition_error.clear();
+  ui.breakpoints.editing.reset();
+  ui.breakpoints.creating.reset();
+  ui.breakpoints.condition_error.clear();
 }
 
 void request_instruction_patch_editor(
     const debugger::SessionSnapshot &snapshot, UiState &ui,
     const debugger::InstructionRow &instruction, bool assemble) {
-  ui.instruction_patch_address = instruction.address;
-  ui.instruction_patch_generation = snapshot.generation;
-  ui.instruction_patch_original = instruction.bytes;
-  ui.instruction_patch_assemble = assemble;
+  ui.patch.address = instruction.address;
+  ui.patch.generation = snapshot.generation;
+  ui.patch.original = instruction.bytes;
+  ui.patch.assemble = assemble;
   const std::string initial =
       assemble && snapshot.intel_syntax
           ? instruction.mnemonic + (instruction.operands.empty()
@@ -377,40 +379,37 @@ void request_instruction_patch_editor(
                                         : " " + instruction.operands)
       : assemble ? std::string{}
                  : bytes_as_hex(instruction.bytes);
-  std::snprintf(ui.instruction_patch_text.data(),
-                ui.instruction_patch_text.size(), "%s", initial.c_str());
-  ui.instruction_patch_error.clear();
-  ui.instruction_patch_editor_requested = true;
+  std::snprintf(ui.patch.text.data(), ui.patch.text.size(), "%s",
+                initial.c_str());
+  ui.patch.error.clear();
+  ui.patch.editor_requested = true;
 }
 
 void app_close_instruction_patch_editor(UiState &ui) {
-  ui.instruction_patch_address.reset();
-  ui.instruction_patch_original.clear();
-  ui.instruction_patch_error.clear();
+  ui.patch.address.reset();
+  ui.patch.original.clear();
+  ui.patch.error.clear();
 }
 
 bool app_instruction_patch_session_valid(
     const debugger::SessionSnapshot &snapshot, const UiState &ui) {
-  return ui.instruction_patch_address.has_value() &&
-         ui.instruction_patch_generation == snapshot.generation &&
+  return ui.patch.address.has_value() &&
+         ui.patch.generation == snapshot.generation &&
          snapshot.state == debugger::SessionState::Stopped;
 }
 
 bool app_apply_instruction_patch(debugger::LldbEngine &engine, UiState &ui) {
-  const std::string_view input{ui.instruction_patch_text.data()};
+  const std::string_view input{ui.patch.text.data()};
   if (input.empty()) {
-    ui.instruction_patch_error =
-        ui.instruction_patch_assemble
-            ? l10n::text(l10n::Key::GuiSupportEnterInstruction)
-            : l10n::text(l10n::Key::GuiSupportEnterHexBytes);
-  } else if (!ui.instruction_patch_assemble && !parse_hex_byte_text(input)) {
-    ui.instruction_patch_error =
-        l10n::text(l10n::Key::GuiSupportInvalidHexBytes);
+    ui.patch.error = ui.patch.assemble
+                         ? l10n::text(l10n::Key::GuiSupportEnterInstruction)
+                         : l10n::text(l10n::Key::GuiSupportEnterHexBytes);
+  } else if (!ui.patch.assemble && !parse_hex_byte_text(input)) {
+    ui.patch.error = l10n::text(l10n::Key::GuiSupportInvalidHexBytes);
   } else {
     const std::string command =
-        std::string{ui.instruction_patch_assemble ? "assemble " : "patch "} +
-        address_specification(*ui.instruction_patch_address) + " " +
-        std::string{input};
+        std::string{ui.patch.assemble ? "assemble " : "patch "} +
+        address_specification(*ui.patch.address) + " " + std::string{input};
     engine.execute_command(command);
     app_close_instruction_patch_editor(ui);
     return true;
@@ -432,11 +431,12 @@ module_for_address(const debugger::SessionSnapshot &snapshot,
 std::optional<std::uint64_t>
 selected_file_address(const debugger::SessionSnapshot &snapshot,
                       const UiState &ui) {
-  const auto instruction = std::find_if(
-      snapshot.instructions.begin(), snapshot.instructions.end(),
-      [&ui](const debugger::InstructionRow &row) {
-        return row.address == ui.disassembly_cursor && row.has_file_address;
-      });
+  const auto instruction =
+      std::find_if(snapshot.instructions.begin(), snapshot.instructions.end(),
+                   [&ui](const debugger::InstructionRow &row) {
+                     return row.address == ui.navigation.disassembly_cursor &&
+                            row.has_file_address;
+                   });
   if (instruction != snapshot.instructions.end()) {
     return instruction->file_address;
   }
@@ -445,20 +445,23 @@ selected_file_address(const debugger::SessionSnapshot &snapshot,
       const auto graph_instruction = std::find_if(
           block.instructions.begin(), block.instructions.end(),
           [&ui](const debugger::InstructionRow &row) {
-            return row.address == ui.disassembly_cursor && row.has_file_address;
+            return row.address == ui.navigation.disassembly_cursor &&
+                   row.has_file_address;
           });
       if (graph_instruction != block.instructions.end()) {
         return graph_instruction->file_address;
       }
     }
   }
-  if (ui.disassembly_cursor == snapshot.pc && snapshot.has_pc_file_address) {
+  if (ui.navigation.disassembly_cursor == snapshot.pc &&
+      snapshot.has_pc_file_address) {
     return snapshot.pc_file_address;
   }
-  if (const auto *module = module_for_address(snapshot, ui.disassembly_cursor);
+  if (const auto *module =
+          module_for_address(snapshot, ui.navigation.disassembly_cursor);
       module != nullptr && module->has_load_bias &&
-      ui.disassembly_cursor >= module->load_bias) {
-    return ui.disassembly_cursor - module->load_bias;
+      ui.navigation.disassembly_cursor >= module->load_bias) {
+    return ui.navigation.disassembly_cursor - module->load_bias;
   }
   return std::nullopt;
 }
@@ -531,7 +534,7 @@ bool can_start_or_continue(const debugger::SessionSnapshot &snapshot,
            snapshot.state == debugger::SessionState::TargetLoaded ||
            snapshot.state == debugger::SessionState::Exited ||
            snapshot.state == debugger::SessionState::Error) &&
-          ui.executable_path.front() != '\0');
+          ui.session.executable_path.front() != '\0');
 }
 
 bool can_terminate(const debugger::SessionSnapshot &snapshot) {
@@ -545,19 +548,20 @@ void start_or_continue(const debugger::SessionSnapshot &snapshot,
   if (snapshot.state == debugger::SessionState::Stopped) {
     engine.continue_execution();
   } else {
-    engine.launch(ui.executable_path.data());
+    engine.launch(ui.session.executable_path.data());
   }
 }
 
 void toggle_cursor_breakpoint(const debugger::SessionSnapshot &snapshot,
                               debugger::LldbEngine &engine, const UiState &ui) {
   if (const debugger::BreakpointInfo *breakpoint =
-          breakpoint_info_at(snapshot, ui.disassembly_cursor)) {
+          breakpoint_info_at(snapshot, ui.navigation.disassembly_cursor)) {
     engine.remove_breakpoint(breakpoint->id);
     return;
   }
   char address[32]{};
-  std::snprintf(address, sizeof(address), "0x%" PRIx64, ui.disassembly_cursor);
+  std::snprintf(address, sizeof(address), "0x%" PRIx64,
+                ui.navigation.disassembly_cursor);
   engine.set_breakpoint(address);
 }
 
@@ -582,7 +586,7 @@ bool debug_action_enabled(DebugAction action,
     return can_launch;
   case DebugAction::ToggleBreakpoint:
   case DebugAction::RunToCursor:
-    return stopped && ui.disassembly_cursor != 0;
+    return stopped && ui.navigation.disassembly_cursor != 0;
   case DebugAction::SourceStepInto:
   case DebugAction::SourceStepOver:
   case DebugAction::InstructionStepInto:
@@ -622,7 +626,7 @@ void execute_debug_action(DebugAction action,
     toggle_cursor_breakpoint(snapshot, engine, ui);
     break;
   case DebugAction::RunToCursor:
-    engine.run_to_address(ui.disassembly_cursor);
+    engine.run_to_address(ui.navigation.disassembly_cursor);
     break;
   case DebugAction::SourceStepInto:
     engine.execute_command("step");
@@ -657,8 +661,8 @@ void execute_debug_action(DebugAction action,
 }
 
 void app_select_theme(debugger::LldbEngine &engine, UiState &ui, bool dark) {
-  ui.theme_dark = dark;
-  ui.theme_sync_pending = true;
+  ui.workspace.theme_dark = dark;
+  ui.workspace.theme_sync_pending = true;
   engine.execute_command(dark ? "theme dark" : "theme light");
 }
 

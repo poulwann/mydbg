@@ -1,4 +1,4 @@
-#include "app/Headless.h"
+#include "Scenarios.h"
 #include "app/AppActions.h"
 #include "backend/decompiler/DecompilerEngine.h"
 #include "backend/lldb/LldbEngine.h"
@@ -234,12 +234,38 @@ int run_headless(const char *executable, const char *attach_executable) {
   }
   print_headless_stop(*first_stop);
   if (first_stop->registers.empty() || first_stop->instructions.empty() ||
-      first_stop->breakpoints.empty() || first_stop->memory.empty() ||
-      first_stop->memory_base != first_stop->pc) {
+      first_stop->memory.empty() || first_stop->memory_base != first_stop->pc) {
     std::fputs(l10n::text(l10n::Key::HeadlessInitialDebuggerDataMissing),
                stderr);
     return 4;
   }
+
+  // The launch breakpoint is one-shot; require a resolved user breakpoint,
+  // not the continued presence of the already-consumed main breakpoint.
+  engine.set_breakpoint("calculate");
+  const auto breakpoint_snapshot =
+      wait_for_snapshot(engine, [](const debugger::SessionSnapshot &snapshot) {
+        return std::any_of(snapshot.breakpoints.begin(),
+                           snapshot.breakpoints.end(),
+                           [](const debugger::BreakpointInfo &breakpoint) {
+                             return breakpoint.description.find("calculate") !=
+                                        std::string::npos &&
+                                    !breakpoint.addresses.empty();
+                           });
+      });
+  if (!breakpoint_snapshot) {
+    std::fputs(l10n::text(l10n::Key::HeadlessCalculateBreakpointUnresolved),
+               stderr);
+    return 8;
+  }
+  const auto breakpoint = std::find_if(
+      breakpoint_snapshot->breakpoints.begin(),
+      breakpoint_snapshot->breakpoints.end(),
+      [](const debugger::BreakpointInfo &candidate) {
+        return candidate.description.find("calculate") != std::string::npos;
+      });
+  const std::uint32_t calculate_breakpoint_id = breakpoint->id;
+
   if (std::getenv("MYDBG_REQUIRE_TEST_PLUGIN") != nullptr) {
     engine.execute_command("plugin-ping native");
     if (!wait_for_snapshot(
@@ -343,30 +369,6 @@ int run_headless(const char *executable, const char *attach_executable) {
       return 7;
     }
   }
-
-  engine.set_breakpoint("calculate");
-  const auto breakpoint_snapshot =
-      wait_for_snapshot(engine, [](const debugger::SessionSnapshot &snapshot) {
-        return std::any_of(snapshot.breakpoints.begin(),
-                           snapshot.breakpoints.end(),
-                           [](const debugger::BreakpointInfo &breakpoint) {
-                             return breakpoint.description.find("calculate") !=
-                                        std::string::npos &&
-                                    !breakpoint.addresses.empty();
-                           });
-      });
-  if (!breakpoint_snapshot) {
-    std::fputs(l10n::text(l10n::Key::HeadlessCalculateBreakpointUnresolved),
-               stderr);
-    return 8;
-  }
-  const auto breakpoint = std::find_if(
-      breakpoint_snapshot->breakpoints.begin(),
-      breakpoint_snapshot->breakpoints.end(),
-      [](const debugger::BreakpointInfo &candidate) {
-        return candidate.description.find("calculate") != std::string::npos;
-      });
-  const std::uint32_t calculate_breakpoint_id = breakpoint->id;
 
   engine.set_breakpoint_enabled(calculate_breakpoint_id, false);
   if (!wait_for_snapshot(

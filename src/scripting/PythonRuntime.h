@@ -1,7 +1,5 @@
 #pragma once
 
-#include "backend/lldb/LldbEngine.h"
-
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -11,6 +9,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+namespace debugger {
+class LldbEngine;
+}
 
 namespace debugger::scripting {
 

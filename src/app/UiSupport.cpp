@@ -17,14 +17,17 @@
 namespace mydbg::app {
 
 const std::array<UiPanelSetting, 8> ui_panel_settings{{
-    {"ShowThreads", l10n::Key::WindowThreads, &UiState::show_threads},
-    {"ShowBacktrace", l10n::Key::WindowBacktrace, &UiState::show_backtrace},
-    {"ShowStack", l10n::Key::WindowStackTelescope, &UiState::show_stack},
-    {"ShowMemoryMap", l10n::Key::WindowMemoryMap, &UiState::show_memory_map},
-    {"ShowModules", l10n::Key::WindowModules, &UiState::show_modules},
-    {"ShowSecurity", l10n::Key::WindowElfSecurity, &UiState::show_security},
-    {"ShowHeap", l10n::Key::WindowGlibcHeap, &UiState::show_heap},
-    {"ShowScans", l10n::Key::WindowScans, &UiState::show_scans},
+    {"ShowThreads", l10n::Key::WindowThreads, &WorkspaceState::show_threads},
+    {"ShowBacktrace", l10n::Key::WindowBacktrace,
+     &WorkspaceState::show_backtrace},
+    {"ShowStack", l10n::Key::WindowStackTelescope, &WorkspaceState::show_stack},
+    {"ShowMemoryMap", l10n::Key::WindowMemoryMap,
+     &WorkspaceState::show_memory_map},
+    {"ShowModules", l10n::Key::WindowModules, &WorkspaceState::show_modules},
+    {"ShowSecurity", l10n::Key::WindowElfSecurity,
+     &WorkspaceState::show_security},
+    {"ShowHeap", l10n::Key::WindowGlibcHeap, &WorkspaceState::show_heap},
+    {"ShowScans", l10n::Key::WindowScans, &WorkspaceState::show_scans},
 }};
 
 constexpr float minimum_ui_scale = 0.75F;
@@ -56,75 +59,77 @@ float window_display_scale(SDL_Window *window) {
 
 void capture_window_state(SDL_Window *window, UiState &ui) {
   const SDL_WindowFlags flags = SDL_GetWindowFlags(window);
-  ui.window_maximized = (flags & SDL_WINDOW_MAXIMIZED) != 0;
-  if (ui.window_maximized || (flags & SDL_WINDOW_MINIMIZED) != 0 ||
+  ui.workspace.window_maximized = (flags & SDL_WINDOW_MAXIMIZED) != 0;
+  if (ui.workspace.window_maximized || (flags & SDL_WINDOW_MINIMIZED) != 0 ||
       (flags & SDL_WINDOW_FULLSCREEN) != 0) {
     return;
   }
-  SDL_GetWindowPosition(window, &ui.window_x, &ui.window_y);
-  SDL_GetWindowSize(window, &ui.window_width, &ui.window_height);
-  ui.window_position_saved = ui.window_width > 0 && ui.window_height > 0;
+  SDL_GetWindowPosition(window, &ui.workspace.window_x, &ui.workspace.window_y);
+  SDL_GetWindowSize(window, &ui.workspace.window_width,
+                    &ui.workspace.window_height);
+  ui.workspace.window_position_saved =
+      ui.workspace.window_width > 0 && ui.workspace.window_height > 0;
 }
 
 void SDLCALL executable_dialog_callback(void *userdata,
                                         const char *const *filelist, int) {
-  auto &ui = *static_cast<UiState *>(userdata);
-  const std::lock_guard lock{ui.file_dialog_mutex};
-  ui.file_dialog_open = false;
-  ui.selected_executable.reset();
-  ui.selected_script.reset();
+  auto &files = *static_cast<FileDialogState *>(userdata);
+  const std::lock_guard lock{files.mutex};
+  files.open = false;
+  files.selected_executable.reset();
+  files.selected_script.reset();
   if (filelist == nullptr) {
-    ui.file_dialog_error = SDL_GetError();
+    files.error = SDL_GetError();
   } else if (filelist[0] != nullptr) {
-    if (ui.script_dialog) {
-      ui.selected_script = filelist[0];
+    if (files.script_dialog) {
+      files.selected_script = filelist[0];
     } else {
-      ui.selected_executable = filelist[0];
+      files.selected_executable = filelist[0];
     }
-    ui.file_dialog_error.clear();
+    files.error.clear();
   }
 }
 
-static void show_file_dialog(UiState &ui,
+static void show_file_dialog(FileDialogState &files, SDL_Window *window,
+                             const char *initial_path,
                              const std::array<SDL_DialogFileFilter, 2> &filters,
                              bool script) {
   {
-    const std::lock_guard lock{ui.file_dialog_mutex};
-    if (ui.file_dialog_open) {
+    const std::lock_guard lock{files.mutex};
+    if (files.open) {
       return;
     }
-    ui.file_dialog_open = true;
-    ui.file_dialog_error.clear();
-    ui.script_dialog = script;
-    ui.file_dialog_location =
-        script ? ui.script_path.data() : ui.executable_path.data();
+    files.open = true;
+    files.error.clear();
+    files.script_dialog = script;
+    files.location = initial_path;
   }
-  SDL_ShowOpenFileDialog(executable_dialog_callback, &ui, ui.main_window,
-                         filters.data(), static_cast<int>(filters.size()),
-                         ui.file_dialog_location.empty()
-                             ? nullptr
-                             : ui.file_dialog_location.c_str(),
-                         false);
+  SDL_ShowOpenFileDialog(
+      executable_dialog_callback, &files, window, filters.data(),
+      static_cast<int>(filters.size()),
+      files.location.empty() ? nullptr : files.location.c_str(), false);
 }
 
-void show_executable_dialog(UiState &ui) {
+void show_executable_dialog(FileDialogState &files, SDL_Window *window,
+                            const char *initial_path) {
   static const std::array<SDL_DialogFileFilter, 2> filters{{
       {l10n::text(l10n::Key::GuiSupportExecutableFiles), "elf;bin;out;so"},
       {l10n::text(l10n::Key::GuiSupportAllFiles), "*"},
   }};
-  show_file_dialog(ui, filters, false);
+  show_file_dialog(files, window, initial_path, filters, false);
 }
 
-void show_script_dialog(UiState &ui) {
+void show_script_dialog(FileDialogState &files, SDL_Window *window,
+                        const char *initial_path) {
   static const std::array<SDL_DialogFileFilter, 2> filters{{
       {l10n::text(l10n::Key::GuiSupportPythonScripts), "py"},
       {l10n::text(l10n::Key::GuiSupportAllFiles), "*"},
   }};
-  show_file_dialog(ui, filters, true);
+  show_file_dialog(files, window, initial_path, filters, true);
 }
 
 float effective_ui_scale(const UiState &ui) {
-  return clamp_ui_scale(ui.display_scale * ui.user_scale);
+  return clamp_ui_scale(ui.workspace.display_scale * ui.workspace.user_scale);
 }
 
 void apply_ui_style(bool dark, float scale) {
@@ -147,14 +152,15 @@ void add_system_font(UiState &ui, std::string id, std::string label,
     }
     ImFont *font = ImGui::GetIO().Fonts->AddFontFromFileTTF(path, 13.0F);
     if (font != nullptr) {
-      ui.fonts.push_back(UiFontChoice{std::move(id), std::move(label), font});
+      ui.workspace.fonts.push_back(
+          UiFontChoice{std::move(id), std::move(label), font});
       return;
     }
   }
 }
 
 void load_ui_fonts(UiState &ui) {
-  ui.fonts.push_back(UiFontChoice{
+  ui.workspace.fonts.push_back(UiFontChoice{
       "proggy-vector", l10n::label(l10n::Key::GuiSupportVectorFont),
       ImGui::GetIO().Fonts->AddFontDefaultVector()});
   add_system_font(
@@ -172,12 +178,14 @@ void load_ui_fonts(UiState &ui) {
 }
 
 void select_ui_font(UiState &ui) {
-  auto selected = std::find_if(
-      ui.fonts.begin(), ui.fonts.end(),
-      [&ui](const UiFontChoice &choice) { return choice.id == ui.font_id; });
-  if (selected == ui.fonts.end()) {
-    selected = ui.fonts.begin();
-    ui.font_id = selected->id;
+  auto selected =
+      std::find_if(ui.workspace.fonts.begin(), ui.workspace.fonts.end(),
+                   [&ui](const UiFontChoice &choice) {
+                     return choice.id == ui.workspace.font_id;
+                   });
+  if (selected == ui.workspace.fonts.end()) {
+    selected = ui.workspace.fonts.begin();
+    ui.workspace.font_id = selected->id;
   }
   ImGui::GetIO().FontDefault = selected->font;
 }
@@ -216,45 +224,45 @@ void read_ui_setting(ImGuiContext *, ImGuiSettingsHandler *, void *entry,
   };
   for (const auto &panel : ui_panel_settings) {
     if (key == panel.name) {
-      ui.*panel.visible = value == "1";
+      ui.workspace.*panel.visible = value == "1";
       return;
     }
   }
   if (key == "Theme") {
-    ui.theme_dark = value != "light";
+    ui.workspace.theme_dark = value != "light";
   } else if (key == "UIScale") {
     std::string owned{value};
     char *end = nullptr;
     const float scale = std::strtof(owned.c_str(), &end);
     if (end != owned.c_str() && *end == '\0' && std::isfinite(scale)) {
-      ui.user_scale = clamp_ui_scale(scale);
+      ui.workspace.user_scale = clamp_ui_scale(scale);
     }
   } else if (key == "Font") {
     if (!value.empty()) {
-      ui.font_id = value;
+      ui.workspace.font_id = value;
     }
   } else if (key == "DisassemblyGraph") {
-    ui.disassembly_graph_view = value == "1";
+    ui.navigation.disassembly_graph_view = value == "1";
   } else if (key == "WindowX") {
     if (const auto parsed = integer_value()) {
-      ui.window_x = *parsed;
+      ui.workspace.window_x = *parsed;
     }
   } else if (key == "WindowY") {
     if (const auto parsed = integer_value()) {
-      ui.window_y = *parsed;
+      ui.workspace.window_y = *parsed;
     }
   } else if (key == "WindowWidth") {
     if (const auto parsed = integer_value(); parsed && *parsed > 0) {
-      ui.window_width = *parsed;
+      ui.workspace.window_width = *parsed;
     }
   } else if (key == "WindowHeight") {
     if (const auto parsed = integer_value(); parsed && *parsed > 0) {
-      ui.window_height = *parsed;
+      ui.workspace.window_height = *parsed;
     }
   } else if (key == "WindowPositionSaved") {
-    ui.window_position_saved = value == "1";
+    ui.workspace.window_position_saved = value == "1";
   } else if (key == "WindowMaximized") {
-    ui.window_maximized = value == "1";
+    ui.workspace.window_maximized = value == "1";
   } else if (key.starts_with("Keybinding.") ||
              key.starts_with("PythonKeybinding.") ||
              key.starts_with("NavigationKeybinding.")) {
@@ -282,11 +290,11 @@ void read_ui_setting(ImGuiContext *, ImGuiSettingsHandler *, void *entry,
           }
         };
         if (python_binding) {
-          load_binding(script_actions, ui.script_keybindings);
+          load_binding(script_actions, ui.workspace.script_keybindings);
         } else if (navigation_binding) {
-          load_binding(navigation_actions, ui.navigation_keybindings);
+          load_binding(navigation_actions, ui.workspace.navigation_keybindings);
         } else {
-          load_binding(debug_actions, ui.keybindings);
+          load_binding(debug_actions, ui.workspace.keybindings);
         }
       }
     }
@@ -300,10 +308,11 @@ void write_ui_settings(ImGuiContext *, ImGuiSettingsHandler *handler,
                   "Theme=%s\n"
                   "UIScale=%.3f\n"
                   "Font=%s\n",
-                  ui.theme_dark ? "dark" : "light",
-                  static_cast<double>(ui.user_scale), ui.font_id.c_str());
+                  ui.workspace.theme_dark ? "dark" : "light",
+                  static_cast<double>(ui.workspace.user_scale),
+                  ui.workspace.font_id.c_str());
   for (const auto &panel : ui_panel_settings) {
-    output->appendf("%s=%d\n", panel.name, ui.*panel.visible ? 1 : 0);
+    output->appendf("%s=%d\n", panel.name, ui.workspace.*panel.visible ? 1 : 0);
   }
   output->appendf("DisassemblyGraph=%d\n"
                   "WindowX=%d\n"
@@ -312,21 +321,24 @@ void write_ui_settings(ImGuiContext *, ImGuiSettingsHandler *handler,
                   "WindowHeight=%d\n"
                   "WindowPositionSaved=%d\n"
                   "WindowMaximized=%d\n",
-                  ui.disassembly_graph_view ? 1 : 0, ui.window_x, ui.window_y,
-                  ui.window_width, ui.window_height,
-                  ui.window_position_saved ? 1 : 0,
-                  ui.window_maximized ? 1 : 0);
+                  ui.navigation.disassembly_graph_view ? 1 : 0,
+                  ui.workspace.window_x, ui.workspace.window_y,
+                  ui.workspace.window_width, ui.workspace.window_height,
+                  ui.workspace.window_position_saved ? 1 : 0,
+                  ui.workspace.window_maximized ? 1 : 0);
   for (const DebugActionDefinition &action : debug_actions) {
     output->appendf("Keybinding.%s=%d\n", action.id,
-                    ui.keybindings[action_index(action.action)]);
+                    ui.workspace.keybindings[action_index(action.action)]);
   }
   for (const ScriptActionDefinition &action : script_actions) {
-    output->appendf("PythonKeybinding.%s=%d\n", action.id,
-                    ui.script_keybindings[action_index(action.action)]);
+    output->appendf(
+        "PythonKeybinding.%s=%d\n", action.id,
+        ui.workspace.script_keybindings[action_index(action.action)]);
   }
   for (const NavigationActionDefinition &action : navigation_actions) {
-    output->appendf("NavigationKeybinding.%s=%d\n", action.id,
-                    ui.navigation_keybindings[action_index(action.action)]);
+    output->appendf(
+        "NavigationKeybinding.%s=%d\n", action.id,
+        ui.workspace.navigation_keybindings[action_index(action.action)]);
   }
   output->append("\n");
 }
@@ -439,7 +451,7 @@ std::string migrate_window_layout(std::string_view layout) {
 std::uint32_t panel_visibility(const UiState &ui) {
   std::uint32_t visibility = 0;
   for (std::size_t index = 0; index < std::size(ui_panel_settings); ++index) {
-    if (ui.*ui_panel_settings[index].visible)
+    if (ui.workspace.*ui_panel_settings[index].visible)
       visibility |= 1U << index;
   }
   return visibility;
@@ -462,13 +474,14 @@ bool follow_address(const debugger::SessionSnapshot &snapshot,
 }
 
 bool navigation_input_allowed(const UiState &ui) {
-  return !ui.keybinding_capture && !ImGui::GetIO().WantTextInput &&
-         ImGui::GetActiveID() == 0 && !ui.condition_editor_requested &&
-         !ui.editing_breakpoint && !ui.creating_conditional_breakpoint &&
-         !ui.instruction_patch_address && ui.register_edit_name.empty() &&
-         !ui.memory_edit_mode &&
-         ui.decompiler_dialog == DecompilerDialog::None &&
-         !ui.navigation_dialog_requested && !ui.navigation_dialog_open &&
+  return !ui.workspace.keybinding_capture && !ImGui::GetIO().WantTextInput &&
+         ImGui::GetActiveID() == 0 &&
+         !ui.breakpoints.condition_editor_requested &&
+         !ui.breakpoints.editing && !ui.breakpoints.creating &&
+         !ui.patch.address && ui.registers.edit_name.empty() &&
+         !ui.memory.edit_mode &&
+         ui.decompiler.dialog == DecompilerDialog::None &&
+         !ui.navigation.dialog_requested && !ui.navigation.dialog_open &&
          !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId |
                                           ImGuiPopupFlags_AnyPopupLevel);
 }
@@ -476,9 +489,9 @@ bool navigation_input_allowed(const UiState &ui) {
 void dispatch_navigation_shortcuts(const debugger::SessionSnapshot &snapshot,
                                    debugger::LldbEngine &engine, UiState &ui,
                                    bool decompiler_view, bool control_lease) {
-  ui.navigation_control_locked = control_lease;
+  ui.navigation.control_locked = control_lease;
   if (control_lease || snapshot.state != debugger::SessionState::Stopped ||
-      ui.navigation_dispatch_frame == ImGui::GetFrameCount() ||
+      ui.navigation.dispatch_frame == ImGui::GetFrameCount() ||
       !navigation_input_allowed(ui)) {
     return;
   }
@@ -488,7 +501,7 @@ void dispatch_navigation_shortcuts(const debugger::SessionSnapshot &snapshot,
       ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows);
   for (const NavigationActionDefinition &definition : navigation_actions) {
     const ImGuiKeyChord binding =
-        ui.navigation_keybindings[action_index(definition.action)];
+        ui.workspace.navigation_keybindings[action_index(definition.action)];
     const ImGuiKey key = static_cast<ImGuiKey>(binding & ~ImGuiMod_Mask_);
     const bool mouse = navigation_mouse_key(key);
     if (binding == 0 || !(mouse ? hovered : focused) ||
@@ -497,7 +510,7 @@ void dispatch_navigation_shortcuts(const debugger::SessionSnapshot &snapshot,
       continue;
     }
     // Focus changes may make the second code pane eligible later this frame.
-    ui.navigation_dispatch_frame = ImGui::GetFrameCount();
+    ui.navigation.dispatch_frame = ImGui::GetFrameCount();
     ImGui::SetKeyOwner(key, ImGui::GetCurrentWindow()->ID,
                        ImGuiInputFlags_LockThisFrame);
     switch (definition.action) {
@@ -510,7 +523,7 @@ void dispatch_navigation_shortcuts(const debugger::SessionSnapshot &snapshot,
       app_traverse_navigation_history(snapshot, engine, ui, true);
       break;
     case NavigationAction::Follow:
-      ui.navigation_follow_requested = true;
+      ui.navigation.follow_requested = true;
       break;
     case NavigationAction::JumpAddress:
       app_request_navigation_dialog(snapshot, ui, decompiler_view);
@@ -540,7 +553,7 @@ void dispatch_navigation_shortcuts(const debugger::SessionSnapshot &snapshot,
 }
 
 std::string keybinding_name(const UiState &ui, DebugAction action) {
-  const ImGuiKeyChord binding = ui.keybindings[action_index(action)];
+  const ImGuiKeyChord binding = ui.workspace.keybindings[action_index(action)];
   return binding == 0 ? std::string{}
                       : std::string{ImGui::GetKeyChordName(binding)};
 }
@@ -548,7 +561,7 @@ std::string keybinding_name(const UiState &ui, DebugAction action) {
 void dispatch_debugger_shortcuts(const debugger::SessionSnapshot &snapshot,
                                  debugger::LldbEngine &engine,
                                  const UiState &ui, bool control_lease) {
-  if (ui.keybinding_capture || ImGui::GetIO().WantTextInput) {
+  if (ui.workspace.keybinding_capture || ImGui::GetIO().WantTextInput) {
     return;
   }
   const ImGuiWindow *focused = ImGui::GetCurrentContext()->NavWindow;
@@ -568,13 +581,13 @@ void dispatch_debugger_shortcuts(const debugger::SessionSnapshot &snapshot,
         !control_lease || definition.action == DebugAction::Pause ||
         definition.action == DebugAction::Terminate;
     const ImGuiKeyChord binding =
-        ui.keybindings[action_index(definition.action)];
+        ui.workspace.keybindings[action_index(definition.action)];
     // Navigation has priority even for collisions loaded from an older ini,
     // before the code panels register their focused shortcut routes.
     if (navigation_active &&
-        std::find(ui.navigation_keybindings.begin(),
-                  ui.navigation_keybindings.end(),
-                  binding) != ui.navigation_keybindings.end()) {
+        std::find(ui.workspace.navigation_keybindings.begin(),
+                  ui.workspace.navigation_keybindings.end(),
+                  binding) != ui.workspace.navigation_keybindings.end()) {
       continue;
     }
     if (lease_allows_action && binding != 0 &&
@@ -595,7 +608,7 @@ bool modifier_key(ImGuiKey key) {
 
 void assign_keybinding(UiState &ui, std::size_t capture_index,
                        ImGuiKeyChord binding) {
-  ui.keybinding_message.clear();
+  ui.workspace.keybinding_message.clear();
   const auto remove_duplicates = [&](auto &bindings, const auto &actions,
                                      std::size_t keep, l10n::Key message) {
     if (binding == 0) {
@@ -604,7 +617,7 @@ void assign_keybinding(UiState &ui, std::size_t capture_index,
     for (std::size_t other = 0; other < bindings.size(); ++other) {
       if (other != keep && bindings[other] == binding) {
         bindings[other] = 0;
-        ui.keybinding_message =
+        ui.workspace.keybinding_message =
             l10n::format(message, l10n::text(actions[other].label));
       }
     }
@@ -612,56 +625,60 @@ void assign_keybinding(UiState &ui, std::size_t capture_index,
   const std::size_t navigation_begin =
       debug_actions.size() + script_actions.size();
   if (capture_index < debug_actions.size()) {
-    remove_duplicates(ui.keybindings, debug_actions, capture_index,
+    remove_duplicates(ui.workspace.keybindings, debug_actions, capture_index,
                       l10n::Key::GuiSupportDuplicateNativeBinding);
-    remove_duplicates(ui.navigation_keybindings, navigation_actions,
+    remove_duplicates(ui.workspace.navigation_keybindings, navigation_actions,
                       navigation_actions.size(),
                       l10n::Key::GuiSupportDuplicateNavigationBinding);
-    ui.keybindings[capture_index] = binding;
+    ui.workspace.keybindings[capture_index] = binding;
   } else if (capture_index < navigation_begin) {
     const std::size_t script_index = capture_index - debug_actions.size();
-    remove_duplicates(ui.script_keybindings, script_actions, script_index,
+    remove_duplicates(ui.workspace.script_keybindings, script_actions,
+                      script_index,
                       l10n::Key::GuiSupportDuplicatePythonBinding);
-    ui.script_keybindings[script_index] = binding;
+    ui.workspace.script_keybindings[script_index] = binding;
   } else if (capture_index < navigation_begin + navigation_actions.size()) {
     const std::size_t navigation_index = capture_index - navigation_begin;
-    remove_duplicates(ui.navigation_keybindings, navigation_actions,
+    remove_duplicates(ui.workspace.navigation_keybindings, navigation_actions,
                       navigation_index,
                       l10n::Key::GuiSupportDuplicateNavigationBinding);
-    remove_duplicates(ui.keybindings, debug_actions, debug_actions.size(),
+    remove_duplicates(ui.workspace.keybindings, debug_actions,
+                      debug_actions.size(),
                       l10n::Key::GuiSupportDuplicateNativeBinding);
-    ui.navigation_keybindings[navigation_index] = binding;
+    ui.workspace.navigation_keybindings[navigation_index] = binding;
   } else {
-    ui.keybinding_capture.reset();
+    ui.workspace.keybinding_capture.reset();
     return;
   }
-  ui.keybinding_capture.reset();
+  ui.workspace.keybinding_capture.reset();
   ImGui::MarkIniSettingsDirty();
 }
 
 void ui_restore_keybindings(UiState &ui) {
-  ui.keybindings = default_keybindings();
-  ui.script_keybindings = default_script_keybindings();
-  ui.navigation_keybindings = default_navigation_keybindings();
-  ui.keybinding_capture.reset();
-  ui.keybinding_message = l10n::text(l10n::Key::GuiSupportDefaultsRestored);
+  ui.workspace.keybindings = default_keybindings();
+  ui.workspace.script_keybindings = default_script_keybindings();
+  ui.workspace.navigation_keybindings = default_navigation_keybindings();
+  ui.workspace.keybinding_capture.reset();
+  ui.workspace.keybinding_message =
+      l10n::text(l10n::Key::GuiSupportDefaultsRestored);
   ImGui::MarkIniSettingsDirty();
 }
 
 void ui_capture_keybinding(UiState &ui) {
-  if (ui.keybinding_capture) {
+  if (ui.workspace.keybinding_capture) {
     ImGui::SetNextFrameWantCaptureKeyboard(true);
     const bool navigation_capture =
-        *ui.keybinding_capture >= debug_actions.size() + script_actions.size();
+        *ui.workspace.keybinding_capture >=
+        debug_actions.size() + script_actions.size();
     if (navigation_capture) {
       ImGui::SetNextFrameWantCaptureMouse(true);
     }
     // A binding button's activation must not assign that same input.
-    if (ui.keybinding_capture_frame != ImGui::GetFrameCount()) {
+    if (ui.workspace.keybinding_capture_frame != ImGui::GetFrameCount()) {
       const ImGuiKey clear_key =
           navigation_capture ? ImGuiKey_Delete : ImGuiKey_Escape;
       if (ImGui::IsKeyPressed(clear_key, false)) {
-        assign_keybinding(ui, *ui.keybinding_capture, 0);
+        assign_keybinding(ui, *ui.workspace.keybinding_capture, 0);
       } else {
         const int key_end =
             navigation_capture ? ImGuiKey_MouseX2 + 1 : ImGuiKey_GamepadStart;
@@ -670,7 +687,7 @@ void ui_capture_keybinding(UiState &ui) {
           const ImGuiKey key = static_cast<ImGuiKey>(raw_key);
           if (binding_key_supported(key, navigation_capture) &&
               !modifier_key(key) && ImGui::IsKeyPressed(key, false)) {
-            assign_keybinding(ui, *ui.keybinding_capture,
+            assign_keybinding(ui, *ui.workspace.keybinding_capture,
                               ImGui::GetIO().KeyMods | key);
             break;
           }

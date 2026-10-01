@@ -1,17 +1,25 @@
 #pragma once
 
+#include "backend/DebuggerTypes.h"
 #include "backend/decompiler/DecompilerEngine.h"
-#include "backend/lldb/LldbEngine.h"
 #include "scripting/PythonRuntime.h"
 
 namespace debugger::help {
 class HelpSystem;
 }
 
+namespace debugger {
+class LldbEngine;
+}
+
 namespace mydbg::app {
 
 struct UiState;
 
+void dispatch_contextual_shortcuts(
+    const debugger::SessionSnapshot &snapshot, debugger::LldbEngine &engine,
+    debugger::scripting::PythonRuntime &runtime, UiState &ui,
+    const debugger::scripting::ScriptSnapshot &script);
 void draw_application_workspace(
     const debugger::SessionSnapshot &snapshot,
     const debugger::scripting::ScriptSnapshot &script,

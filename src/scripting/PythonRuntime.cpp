@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
@@ -21,6 +22,65 @@ namespace {
 
 constexpr std::size_t maximum_script_output = 1024U * 1024U;
 constexpr std::size_t maximum_traceback = 1024U * 1024U;
+
+// Construct after acquiring the GIL and before changing per-job interpreter
+// state. All saved Python references are restored and destroyed under that
+// same GIL; this scope does not create another interpreter or worker.
+class PythonJobScope final {
+public:
+  PythonJobScope(const py::module_ &sys, std::string script_directory,
+                 bool debug)
+      : sys_(sys), path_(sys.attr("path")),
+        original_stdout_(sys.attr("stdout")),
+        original_stderr_(sys.attr("stderr")),
+        original_trace_(debug ? sys.attr("gettrace")() : py::none()),
+        script_directory_(std::move(script_directory)), debug_(debug) {
+    path_.attr("insert")(0, script_directory_);
+  }
+
+  PythonJobScope(const PythonJobScope &) = delete;
+  PythonJobScope &operator=(const PythonJobScope &) = delete;
+
+  ~PythonJobScope() noexcept(false) {
+    if (std::uncaught_exceptions() == 0) {
+      restore();
+    } else {
+      try {
+        restore();
+      } catch (...) {
+        // A setup failure is already propagating. Do not replace it with a
+        // secondary restoration failure or terminate during unwinding.
+      }
+    }
+  }
+
+private:
+  void restore() {
+    if (debug_) {
+      sys_.attr("settrace")(original_trace_);
+    }
+    sys_.attr("stdout") = original_stdout_;
+    sys_.attr("stderr") = original_stderr_;
+    if (py::len(path_) > 0 &&
+        py::cast<std::string>(path_[0]) == script_directory_) {
+      path_.attr("pop")(0);
+    } else {
+      try {
+        path_.attr("remove")(script_directory_);
+      } catch (const py::error_already_set &) {
+        PyErr_Clear();
+      }
+    }
+  }
+
+  const py::module_ &sys_;
+  py::list path_;
+  py::object original_stdout_;
+  py::object original_stderr_;
+  py::object original_trace_;
+  std::string script_directory_;
+  bool debug_;
+};
 
 bool finished(ScriptStatus status) {
   return status == ScriptStatus::Idle || status == ScriptStatus::Succeeded ||
@@ -398,14 +458,8 @@ void PythonRuntime::run() {
       py::gil_scoped_acquire acquire;
       py::module_ sys = py::module_::import("sys");
       py::module_ types = py::module_::import("types");
-      py::list path = sys.attr("path");
       const std::filesystem::path script_path = std::filesystem::absolute(file);
-      const std::string script_directory = script_path.parent_path().string();
-      path.attr("insert")(0, script_directory);
-
-      py::object original_stdout = sys.attr("stdout");
-      py::object original_stderr = sys.attr("stderr");
-      py::object original_trace = debug ? sys.attr("gettrace")() : py::none();
+      PythonJobScope job_scope{sys, script_path.parent_path().string(), debug};
       py::dict capture_namespace;
       capture_namespace["_append"] = py::cpp_function(
           [this](const std::string &text) { append_output(text); });
@@ -500,24 +554,6 @@ void PythonRuntime::run() {
         sys.attr("settrace")(capture_namespace["_mydbg_trace"]);
       }
 
-      const auto restore_python_state = [&] {
-        if (debug) {
-          sys.attr("settrace")(original_trace);
-        }
-        sys.attr("stdout") = original_stdout;
-        sys.attr("stderr") = original_stderr;
-        if (py::len(path) > 0 &&
-            py::cast<std::string>(path[0]) == script_directory) {
-          path.attr("pop")(0);
-        } else {
-          try {
-            path.attr("remove")(script_directory);
-          } catch (const py::error_already_set &) {
-            PyErr_Clear();
-          }
-        }
-      };
-
       try {
         if (cancellation->load()) {
           throw std::runtime_error(
@@ -553,7 +589,6 @@ void PythonRuntime::run() {
         result = cancellation->load() ? ScriptStatus::Cancelled
                                       : ScriptStatus::Failed;
       }
-      restore_python_state();
     } catch (const std::exception &error) {
       traceback = error.what();
       result =

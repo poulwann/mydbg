@@ -1,6 +1,6 @@
 #include "app/MemoryInspection.h"
 #include "app/DebuggerController.h"
-#include "backend/lldb/LldbEngine.h"
+#include "backend/DebuggerTypes.h"
 
 #include <charconv>
 #include <utility>

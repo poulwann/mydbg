@@ -1,5 +1,9 @@
 #include "app/PythonController.h"
-#include "app/AppState.h"
+#include "app/FileDialogState.h"
+#include "app/PythonEditorState.h"
+#include "app/PythonState.h"
+#include "app/WorkspaceState.h"
+#include "backend/lldb/LldbEngine.h"
 #include "localization/Localization.h"
 #include "scripting/PythonRuntime.h"
 
@@ -39,7 +43,7 @@ const char *script_status_text(debugger::scripting::ScriptStatus status) {
 
 void execute_console_input(std::string command, debugger::LldbEngine &engine,
                            debugger::scripting::PythonRuntime &runtime,
-                           UiState &ui, bool control_lease) {
+                           PythonState &state, bool control_lease) {
   const auto whitespace = [](unsigned char byte) { return std::isspace(byte); };
   command.erase(command.begin(),
                 std::find_if_not(command.begin(), command.end(), whitespace));
@@ -49,7 +53,7 @@ void execute_console_input(std::string command, debugger::LldbEngine &engine,
   }
   if (command == "py status") {
     const auto script = runtime.snapshot();
-    ui.python_console_message =
+    state.console_message =
         script.file.empty()
             ? l10n::format(l10n::Key::GuiPythonConsoleStatus,
                            script_status_text(script.status))
@@ -58,37 +62,36 @@ void execute_console_input(std::string command, debugger::LldbEngine &engine,
                            script.file.c_str());
   } else if (command == "py stop") {
     runtime.stop();
-    ui.python_console_message =
+    state.console_message =
         l10n::text(l10n::Key::GuiPythonCancellationRequested);
   } else if (command.starts_with("py run ")) {
     std::string file = command.substr(7);
     file.erase(file.begin(),
                std::find_if_not(file.begin(), file.end(), whitespace));
     if (file.empty()) {
-      ui.python_console_message = l10n::text(l10n::Key::GuiPythonRunUsage);
+      state.console_message = l10n::text(l10n::Key::GuiPythonRunUsage);
     } else {
-      std::snprintf(ui.script_path.data(), ui.script_path.size(), "%s",
-                    file.c_str());
-      ui.python_console_message =
-          runtime.run_file(file) ? l10n::text(l10n::Key::GuiPythonScriptQueued)
-                                 : l10n::text(l10n::Key::GuiPythonRuntimeBusy);
+      std::snprintf(state.path.data(), state.path.size(), "%s", file.c_str());
+      state.console_message = runtime.run_file(file)
+                                  ? l10n::text(l10n::Key::GuiPythonScriptQueued)
+                                  : l10n::text(l10n::Key::GuiPythonRuntimeBusy);
     }
   } else if (command == "py" || command.starts_with("py ")) {
-    ui.python_console_message = l10n::text(l10n::Key::GuiPythonCommandUsage);
+    state.console_message = l10n::text(l10n::Key::GuiPythonCommandUsage);
   } else if (control_lease) {
-    ui.python_console_message = l10n::text(l10n::Key::GuiPythonControlOwned);
+    state.console_message = l10n::text(l10n::Key::GuiPythonControlOwned);
   } else {
     engine.execute_command(std::move(command));
-    ui.python_console_message.clear();
+    state.console_message.clear();
   }
 }
 
-void load_script_source(UiState &ui, const std::string &file) {
+void load_script_source(PythonState &state, const std::string &file) {
   constexpr std::uintmax_t maximum_editor_bytes = 4U * 1024U * 1024U;
   std::error_code size_error;
   const std::uintmax_t size = std::filesystem::file_size(file, size_error);
   if (size_error || size > maximum_editor_bytes) {
-    ui.script_file_error =
+    state.file_error =
         size_error ? l10n::format(l10n::Key::GuiPythonInspectScriptFailed,
                                   size_error.message().c_str())
                    : l10n::text(l10n::Key::GuiPythonEditorSizeLimit);
@@ -96,42 +99,41 @@ void load_script_source(UiState &ui, const std::string &file) {
   }
   std::ifstream input{file, std::ios::binary};
   if (!input) {
-    ui.script_file_error = l10n::text(l10n::Key::GuiPythonOpenScriptFailed);
+    state.file_error = l10n::text(l10n::Key::GuiPythonOpenScriptFailed);
     return;
   }
   std::string source(static_cast<std::size_t>(size), '\0');
   input.read(source.data(), static_cast<std::streamsize>(source.size()));
   if (!input && !input.eof()) {
-    ui.script_file_error = l10n::text(l10n::Key::GuiPythonReadScriptFailed);
+    state.file_error = l10n::text(l10n::Key::GuiPythonReadScriptFailed);
     return;
   }
-  ui.script_editor.SetText(source);
-  ui.script_loaded_path = file;
-  ui.script_dirty = false;
-  ui.script_file_error.clear();
+  state.editor->text.SetText(source);
+  state.loaded_path = file;
+  state.dirty = false;
+  state.file_error.clear();
 }
 
-void save_script_source(UiState &ui) {
-  if (ui.script_path.front() == '\0') {
-    ui.script_file_error = l10n::text(l10n::Key::GuiPythonSavePathRequired);
+void save_script_source(PythonState &state) {
+  if (state.path.front() == '\0') {
+    state.file_error = l10n::text(l10n::Key::GuiPythonSavePathRequired);
     return;
   }
-  std::ofstream output{ui.script_path.data(),
-                       std::ios::binary | std::ios::trunc};
+  std::ofstream output{state.path.data(), std::ios::binary | std::ios::trunc};
   if (!output) {
-    ui.script_file_error =
+    state.file_error =
         l10n::text(l10n::Key::GuiPythonOpenScriptForWritingFailed);
     return;
   }
-  const std::string source = ui.script_editor.GetText();
+  const std::string source = state.editor->text.GetText();
   output.write(source.data(), static_cast<std::streamsize>(source.size()));
   if (!output) {
-    ui.script_file_error = l10n::text(l10n::Key::GuiPythonWriteScriptFailed);
+    state.file_error = l10n::text(l10n::Key::GuiPythonWriteScriptFailed);
     return;
   }
-  ui.script_loaded_path = ui.script_path.data();
-  ui.script_dirty = false;
-  ui.script_file_error.clear();
+  state.loaded_path = state.path.data();
+  state.dirty = false;
+  state.file_error.clear();
 }
 
 std::vector<std::uint32_t>
@@ -148,48 +150,49 @@ script_breakpoint_lines(const TextEditor::Breakpoints &breakpoints) {
 }
 
 bool start_python_debugger(debugger::scripting::PythonRuntime &runtime,
-                           UiState &ui) {
-  if (!runtime.debug_source(ui.script_path.data(), ui.script_editor.GetText(),
-                            script_breakpoint_lines(ui.script_breakpoints))) {
-    ui.python_console_message = l10n::text(l10n::Key::GuiPythonRuntimeBusy);
+                           PythonState &state) {
+  if (!runtime.debug_source(
+          state.path.data(), state.editor->text.GetText(),
+          script_breakpoint_lines(state.editor->breakpoints))) {
+    state.console_message = l10n::text(l10n::Key::GuiPythonRuntimeBusy);
     return false;
   }
-  ui.python_console_message = l10n::text(l10n::Key::GuiPythonDebuggerStarted);
+  state.console_message = l10n::text(l10n::Key::GuiPythonDebuggerStarted);
   return true;
 }
 
 void run_python_script(debugger::scripting::PythonRuntime &runtime,
-                       UiState &ui) {
+                       PythonState &state) {
   const bool started = runtime.debug_source(
-      ui.script_path.data(), ui.script_editor.GetText(), {}, false);
-  ui.python_console_message =
-      started ? l10n::text(l10n::Key::GuiPythonScriptRunning)
-              : l10n::text(l10n::Key::GuiPythonRuntimeBusy);
+      state.path.data(), state.editor->text.GetText(), {}, false);
+  state.console_message = started
+                              ? l10n::text(l10n::Key::GuiPythonScriptRunning)
+                              : l10n::text(l10n::Key::GuiPythonRuntimeBusy);
 }
 
 void toggle_script_breakpoint(debugger::scripting::PythonRuntime &runtime,
-                              UiState &ui) {
-  const int cursor_line = ui.script_editor.GetCursorPosition().mLine + 1;
-  if (ui.script_breakpoints.contains(cursor_line)) {
-    ui.script_breakpoints.erase(cursor_line);
+                              PythonState &state) {
+  const int cursor_line = state.editor->text.GetCursorPosition().mLine + 1;
+  if (state.editor->breakpoints.contains(cursor_line)) {
+    state.editor->breakpoints.erase(cursor_line);
   } else {
-    ui.script_breakpoints.insert(cursor_line);
+    state.editor->breakpoints.insert(cursor_line);
   }
-  runtime.set_breakpoints(script_breakpoint_lines(ui.script_breakpoints));
+  runtime.set_breakpoints(script_breakpoint_lines(state.editor->breakpoints));
 }
 
 bool script_action_enabled(ScriptAction action,
                            const debugger::scripting::ScriptSnapshot &script,
-                           const UiState &ui) {
+                           const PythonState &state) {
   const bool paused =
       script.debug_state == debugger::scripting::ScriptDebugState::Paused;
   switch (action) {
   case ScriptAction::DebugContinue:
-    return paused || (!script.control_lease && !ui.script_loaded_path.empty());
+    return paused || (!script.control_lease && !state.loaded_path.empty());
   case ScriptAction::Run:
-    return !script.control_lease && !ui.script_loaded_path.empty();
+    return !script.control_lease && !state.loaded_path.empty();
   case ScriptAction::ToggleBreakpoint:
-    return !ui.script_loaded_path.empty();
+    return !state.loaded_path.empty();
   case ScriptAction::StepInto:
   case ScriptAction::StepOver:
   case ScriptAction::StepOut:
@@ -207,20 +210,20 @@ bool script_action_enabled(ScriptAction action,
 bool execute_script_action(ScriptAction action,
                            const debugger::scripting::ScriptSnapshot &script,
                            debugger::scripting::PythonRuntime &runtime,
-                           UiState &ui) {
+                           PythonState &state) {
   switch (action) {
   case ScriptAction::DebugContinue:
     if (script.debug_state == debugger::scripting::ScriptDebugState::Paused) {
       runtime.continue_script();
     } else {
-      return start_python_debugger(runtime, ui);
+      return start_python_debugger(runtime, state);
     }
     break;
   case ScriptAction::Run:
-    run_python_script(runtime, ui);
+    run_python_script(runtime, state);
     break;
   case ScriptAction::ToggleBreakpoint:
-    toggle_script_breakpoint(runtime, ui);
+    toggle_script_breakpoint(runtime, state);
     break;
   case ScriptAction::StepInto:
     runtime.step_into_script();
@@ -243,60 +246,61 @@ bool execute_script_action(ScriptAction action,
   return false;
 }
 
-PythonFileDialogState python_sync_script_file(UiState &ui) {
+PythonFileDialogState python_sync_script_file(PythonState &state,
+                                              FileDialogState &files) {
   std::optional<std::string> selected_script;
   std::string file_dialog_error;
   bool file_dialog_open = false;
   {
-    const std::lock_guard lock{ui.file_dialog_mutex};
-    selected_script = std::move(ui.selected_script);
-    ui.selected_script.reset();
-    if (ui.script_dialog) {
-      file_dialog_error = ui.file_dialog_error;
-      file_dialog_open = ui.file_dialog_open;
+    const std::lock_guard lock{files.mutex};
+    selected_script = std::move(files.selected_script);
+    files.selected_script.reset();
+    if (files.script_dialog) {
+      file_dialog_error = files.error;
+      file_dialog_open = files.open;
     }
   }
   if (selected_script) {
-    std::snprintf(ui.script_path.data(), ui.script_path.size(), "%s",
+    std::snprintf(state.path.data(), state.path.size(), "%s",
                   selected_script->c_str());
-    load_script_source(ui, *selected_script);
-  } else if (ui.script_loaded_path.empty() && ui.script_path.front() != '\0') {
-    load_script_source(ui, ui.script_path.data());
+    load_script_source(state, *selected_script);
+  } else if (state.loaded_path.empty() && state.path.front() != '\0') {
+    load_script_source(state, state.path.data());
   }
   return {std::move(file_dialog_error), file_dialog_open};
 }
 
 void python_sync_editor_execution(
-    const debugger::scripting::ScriptSnapshot &script, UiState &ui) {
+    const debugger::scripting::ScriptSnapshot &script, PythonState &state) {
   TextEditor::ErrorMarkers current_line;
   if (script.debug_state != debugger::scripting::ScriptDebugState::Inactive &&
       script.current_line > 0) {
-    if (ui.script_execution_line != script.current_line) {
-      ui.script_editor.SetCursorPosition(TextEditor::Coordinates{
+    if (state.execution_line != script.current_line) {
+      state.editor->text.SetCursorPosition(TextEditor::Coordinates{
           static_cast<int>(script.current_line - 1), 0});
-      ui.script_execution_line = script.current_line;
+      state.execution_line = script.current_line;
     }
     current_line[static_cast<int>(script.current_line)] =
         script.debug_state == debugger::scripting::ScriptDebugState::Paused
             ? l10n::text(l10n::Key::GuiPythonExecutionPausedHere)
             : l10n::text(l10n::Key::GuiPythonExecutingLine);
-    ui.script_editor.SetErrorMarkers(current_line);
+    state.editor->text.SetErrorMarkers(current_line);
   } else {
-    ui.script_editor.SetErrorMarkers({});
-    ui.script_execution_line = 0;
+    state.editor->text.SetErrorMarkers({});
+    state.execution_line = 0;
   }
-  ui.script_editor.SetBreakpoints(ui.script_breakpoints);
-  ui.script_editor.SetReadOnly(script.control_lease);
+  state.editor->text.SetBreakpoints(state.editor->breakpoints);
+  state.editor->text.SetReadOnly(script.control_lease);
 }
 
 void python_load_ctf_demo(debugger::scripting::PythonRuntime &runtime,
-                          UiState &ui) {
-  std::snprintf(ui.script_path.data(), ui.script_path.size(), "%s",
+                          PythonState &state) {
+  std::snprintf(state.path.data(), state.path.size(), "%s",
                 MYDBG_CTF_DEMO_SCRIPT);
-  load_script_source(ui, ui.script_path.data());
-  ui.script_breakpoints = {45, 51, 57, 61, 67, 73, 79, 88};
-  runtime.set_breakpoints(script_breakpoint_lines(ui.script_breakpoints));
-  ui.python_console_message = l10n::text(l10n::Key::GuiPythonCtfDemoLoaded);
+  load_script_source(state, state.path.data());
+  state.editor->breakpoints = {45, 51, 57, 61, 67, 73, 79, 88};
+  runtime.set_breakpoints(script_breakpoint_lines(state.editor->breakpoints));
+  state.console_message = l10n::text(l10n::Key::GuiPythonCtfDemoLoaded);
 }
 
 } // namespace mydbg::app

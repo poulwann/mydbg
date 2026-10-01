@@ -7,6 +7,7 @@
 #include "app/HelpSystem.h"
 #include "app/PythonPanels.h"
 #include "app/UiSupport.h"
+#include "backend/lldb/LldbEngine.h"
 #include "plugins/PluginApi.h"
 
 #include <SDL3/SDL.h>
@@ -88,23 +89,23 @@ int run_gui(const char *initial_executable, const char *initial_script) {
     layout = migrate_window_layout(default_layout);
   }
   ImGui::LoadIniSettingsFromMemory(layout.c_str(), layout.size());
-  SDL_SetWindowSize(window, std::max(ui.window_width, 640),
-                    std::max(ui.window_height, 480));
-  if (ui.window_position_saved) {
-    SDL_SetWindowPosition(window, ui.window_x, ui.window_y);
+  SDL_SetWindowSize(window, std::max(ui.workspace.window_width, 640),
+                    std::max(ui.workspace.window_height, 480));
+  if (ui.workspace.window_position_saved) {
+    SDL_SetWindowPosition(window, ui.workspace.window_x, ui.workspace.window_y);
   }
   SDL_ShowWindow(window);
-  if (ui.window_maximized) {
+  if (ui.workspace.window_maximized) {
     SDL_MaximizeWindow(window);
     SDL_SyncWindow(window);
   }
-  ui.display_scale = window_display_scale(window);
-  ui.user_scale = configured_ui_scale(ui.user_scale);
+  ui.workspace.display_scale = window_display_scale(window);
+  ui.workspace.user_scale = configured_ui_scale(ui.workspace.user_scale);
   load_ui_fonts(ui);
   select_ui_font(ui);
-  ui.applied_ui_scale = effective_ui_scale(ui);
-  ui.applied_dark_theme = ui.theme_dark;
-  apply_ui_style(ui.theme_dark, ui.applied_ui_scale);
+  ui.workspace.applied_ui_scale = effective_ui_scale(ui);
+  ui.workspace.applied_dark_theme = ui.workspace.theme_dark;
+  apply_ui_style(ui.workspace.theme_dark, ui.workspace.applied_ui_scale);
   ImGui_ImplSDL3_InitForOpenGL(window, gl_context);
   ImGui_ImplOpenGL3_Init("#version 330 core");
 
@@ -131,7 +132,7 @@ int run_gui(const char *initial_executable, const char *initial_script) {
       }
       if (event.type == SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED &&
           event.window.windowID == SDL_GetWindowID(window)) {
-        ui.display_scale = window_display_scale(window);
+        ui.workspace.display_scale = window_display_scale(window);
       }
       const bool geometry_event = event.type == SDL_EVENT_WINDOW_MOVED ||
                                   event.type == SDL_EVENT_WINDOW_RESIZED ||
@@ -153,11 +154,11 @@ int run_gui(const char *initial_executable, const char *initial_script) {
       ImGui::MarkIniSettingsDirty();
     }
     const float requested_ui_scale = effective_ui_scale(ui);
-    if (ui.applied_dark_theme != ui.theme_dark ||
-        std::abs(ui.applied_ui_scale - requested_ui_scale) > 0.001F) {
-      apply_ui_style(ui.theme_dark, requested_ui_scale);
-      ui.applied_dark_theme = ui.theme_dark;
-      ui.applied_ui_scale = requested_ui_scale;
+    if (ui.workspace.applied_dark_theme != ui.workspace.theme_dark ||
+        std::abs(ui.workspace.applied_ui_scale - requested_ui_scale) > 0.001F) {
+      apply_ui_style(ui.workspace.theme_dark, requested_ui_scale);
+      ui.workspace.applied_dark_theme = ui.workspace.theme_dark;
+      ui.workspace.applied_ui_scale = requested_ui_scale;
     }
     const std::uint32_t visibility_before = panel_visibility(ui);
     update_application_selection(snapshot, ui);

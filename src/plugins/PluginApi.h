@@ -1,6 +1,6 @@
 #pragma once
 
-#include "backend/lldb/LldbEngine.h"
+#include "backend/DebuggerTypes.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -11,95 +11,99 @@
 #include <string_view>
 #include <vector>
 
+namespace debugger {
+class LldbEngine;
+}
+
 namespace debugger::plugins {
 
 inline constexpr std::uint32_t plugin_abi_version = 2;
 
 enum class Event {
-    SnapshotUpdated,
-    TargetLoaded,
-    ProcessStarted,
-    ProcessStopped,
-    ProcessContinued,
-    ProcessExited,
-    ThreadSelected,
-    FrameSelected,
+  SnapshotUpdated,
+  TargetLoaded,
+  ProcessStarted,
+  ProcessStopped,
+  ProcessContinued,
+  ProcessExited,
+  ThreadSelected,
+  FrameSelected,
 };
 
 enum class Surface {
-    DockPanel,
-    Sidebar,
-    Widget,
-    Menu,
+  DockPanel,
+  Sidebar,
+  Widget,
+  Menu,
 };
 
 using CommandCallback =
-    std::function<std::string(std::string_view, const SessionSnapshot&)>;
+    std::function<std::string(std::string_view, const SessionSnapshot &)>;
 using RenderCallback =
-    std::function<void(const SessionSnapshot&, LldbEngine&)>;
-using EventCallback =
-    std::function<void(Event, const SessionSnapshot&)>;
+    std::function<void(const SessionSnapshot &, LldbEngine &)>;
+using EventCallback = std::function<void(Event, const SessionSnapshot &)>;
 
 struct CommandRegistration {
-    std::string name;
-    std::string help;
-    CommandCallback callback;
+  std::string name;
+  std::string help;
+  CommandCallback callback;
 };
 
 struct SurfaceRegistration {
-    std::string name;
-    Surface surface{Surface::DockPanel};
-    RenderCallback callback;
+  std::string name;
+  Surface surface{Surface::DockPanel};
+  RenderCallback callback;
 };
 
 class PluginRegistry final {
 public:
-    static PluginRegistry& instance();
+  static PluginRegistry &instance();
 
-    bool register_command(std::string name, std::string help,
-                          CommandCallback callback);
-    bool register_surface(std::string name, Surface surface,
-                          RenderCallback callback);
-    void subscribe(EventCallback callback);
+  bool register_command(std::string name, std::string help,
+                        CommandCallback callback);
+  bool register_surface(std::string name, Surface surface,
+                        RenderCallback callback);
+  void subscribe(EventCallback callback);
 
-    [[nodiscard]] std::optional<std::string>
-    execute(std::string_view name, std::string_view arguments,
-            const SessionSnapshot &snapshot, bool &failed) const;
-    [[nodiscard]] std::vector<CommandRegistration> commands() const;
-    [[nodiscard]] std::vector<SurfaceRegistration> surfaces() const;
-    void dispatch(Event event, const SessionSnapshot& snapshot) const;
+  [[nodiscard]] std::optional<std::string>
+  execute(std::string_view name, std::string_view arguments,
+          const SessionSnapshot &snapshot, bool &failed) const;
+  [[nodiscard]] std::vector<CommandRegistration> commands() const;
+  [[nodiscard]] std::vector<SurfaceRegistration> surfaces() const;
+  void dispatch(Event event, const SessionSnapshot &snapshot) const;
 
 private:
-    mutable std::mutex mutex_;
-    std::vector<CommandRegistration> commands_;
-    std::vector<SurfaceRegistration> surfaces_;
-    std::vector<EventCallback> subscribers_;
+  mutable std::mutex mutex_;
+  std::vector<CommandRegistration> commands_;
+  std::vector<SurfaceRegistration> surfaces_;
+  std::vector<EventCallback> subscribers_;
 };
 
 class PluginLoader final {
+  // Loading may publish callbacks into the process-wide registry or its
+  // caller-owned copies. Destroying a loader never unloads plugin code.
 public:
-    PluginLoader() = default;
-    PluginLoader(const PluginLoader&) = delete;
-    PluginLoader& operator=(const PluginLoader&) = delete;
-    ~PluginLoader();
+  PluginLoader() = default;
+  PluginLoader(const PluginLoader &) = delete;
+  PluginLoader &operator=(const PluginLoader &) = delete;
+  ~PluginLoader();
 
-    bool load(const std::filesystem::path& path);
-    void load_directory(const std::filesystem::path& directory);
+  bool load(const std::filesystem::path &path);
+  void load_directory(const std::filesystem::path &directory);
 
-    [[nodiscard]] const std::vector<std::string>& errors() const noexcept;
-    [[nodiscard]] const std::vector<std::filesystem::path>&
-    loaded_plugins() const noexcept;
+  [[nodiscard]] const std::vector<std::string> &errors() const noexcept;
+  [[nodiscard]] const std::vector<std::filesystem::path> &
+  loaded_plugins() const noexcept;
 
 private:
-    std::vector<std::filesystem::path> loaded_plugins_;
-    std::vector<std::string> errors_;
+  std::vector<std::filesystem::path> loaded_plugins_;
+  std::vector<std::string> errors_;
 };
 
-using InitializePlugin =
-    bool (*)(PluginRegistry* registry, std::uint32_t abi_version);
+using InitializePlugin = bool (*)(PluginRegistry *registry,
+                                  std::uint32_t abi_version);
 
 } // namespace debugger::plugins
 
-extern "C" bool mydbg_plugin_init(
-    debugger::plugins::PluginRegistry* registry,
-    std::uint32_t abi_version);
+extern "C" bool mydbg_plugin_init(debugger::plugins::PluginRegistry *registry,
+                                  std::uint32_t abi_version);

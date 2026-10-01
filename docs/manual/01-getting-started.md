@@ -106,7 +106,7 @@ Run from the repository root in these examples:
 
 `--script` is **not** an open-without-running switch. To inspect an untrusted script without executing it, start the empty GUI and use the Python editor's **Load** or **Browse** control instead.
 
-The command line accepts one ELF path or one of those script forms; it does not accept trailing target arguments, a general command string, or a `--help` switch. Set target arguments and working directory through [launch commands or Python](03-execution.md). The `--headless` family listed below is for built-in smoke scenarios, not an interactive command-line debugger.
+The command line accepts one ELF path or one of those script forms; it does not accept trailing target arguments, a general command string, or a `--help` switch. Set target arguments and working directory through [launch commands or Python](03-execution.md). Fixed developer smoke scenarios use the separate `mydbg_scenarios` executable below, not the production command line.
 
 ### First native session
 
@@ -144,26 +144,26 @@ MYDBG_SESSION_DIR="$session_dir" ./build/dev/mydbg --headless-script ./examples/
 
 ## Developer headless scenarios
 
-These built-in entry points execute fixed scenarios and exit. Their arguments must be the corresponding fixture, not an arbitrary application with different symbols or behavior:
+The `mydbg_scenarios` executable is built only with `BUILD_TESTING` enabled. Its entry points execute fixed scenarios and exit. Their arguments must be the corresponding fixture, not an arbitrary application with different symbols or behavior:
 
 ```sh
-./build/dev/mydbg --headless-keybindings
-./build/dev/mydbg --headless-condition ./build/dev/debuggee_condition
-./build/dev/mydbg --headless-heap ./build/dev/debuggee_heap
-./build/dev/mydbg --headless-scans ./build/dev/debuggee_scans
-./build/dev/mydbg --headless-intelligence ./build/dev/debuggee_intelligence
+./build/dev/mydbg_scenarios --headless-keybindings
+./build/dev/mydbg_scenarios --headless-condition ./build/dev/debuggee_condition
+./build/dev/mydbg_scenarios --headless-heap ./build/dev/debuggee_heap
+./build/dev/mydbg_scenarios --headless-scans ./build/dev/debuggee_scans
+./build/dev/mydbg_scenarios --headless-intelligence ./build/dev/debuggee_intelligence
 ```
 
-`--headless EXECUTABLE [ATTACH_FIXTURE]` runs the native vertical-slice smoke scenario. It is not a replacement for `--headless-script`. Use CTest to supply the correct fixture paths:
+`mydbg_scenarios --headless EXECUTABLE [ATTACH_FIXTURE]` runs the native vertical-slice smoke scenario. It is not a replacement for `mydbg --headless-script`. Prefer CTest: it supplies fixture paths and private home, configuration, cache, and session directories:
 
 ```sh
 ctest --test-dir build/dev --output-on-failure
 ```
 
-Tests requiring remote stubs or cross-architecture tools need those tools installed. A passing native scenario does not prove every QEMU architecture or remote feature works; see the [current limitations](07-troubleshooting.md).
+Tests requiring remote stubs or cross-architecture tools need those tools installed. The `native-dev` configure/build/test presets exclude cross-architecture and symbolic scenarios; `ctest --preset dev -L unit` selects the lightweight unit group from the full build. A passing native scenario does not prove every QEMU architecture or remote feature works; see the [current limitations](07-troubleshooting.md).
 
 ## About the screenshots
 
 The images in this manual are captures of the actual application on an isolated off-screen X11 display, not mockups. Native debugging examples use repository fixtures; Python examples use the bundled CTF script. Crops emphasize the control being explained. Addresses, PIDs, hashes, fonts, and exact layout may differ on your machine.
 
-Headless script mode exercises real debugger behavior without SDL. Screenshots require the graphical renderer, so capture it under Xvfb with a private executable-adjacent mydbg.ini and `MYDBG_SESSION_DIR`, rather than changing a user's desktop or saved sessions. Use PNG assets for both normal Markdown readers and the built-in manual.
+Headless script mode exercises real debugger behavior without SDL. Screenshots require the graphical renderer, so capture it under Xvfb with a private executable-adjacent mydbg.ini, temporary `HOME` and XDG configuration/cache directories, a private `MYDBG_SESSION_DIR`, and an empty `MYDBG_PLUGIN_PATH`, rather than consulting a user's plugins or changing their desktop or saved sessions. Use PNG assets for both normal Markdown readers and the built-in manual.

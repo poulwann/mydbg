@@ -18,7 +18,7 @@ Within each directory, regular files ending in `.so` are sorted by filename and 
 MYDBG_PLUGIN_PATH=/absolute/path/to/trusted-plugins ./build/dev/mydbg
 ```
 
-The GUI `--script` form uses the same startup loading. The developer `--headless` vertical-slice runner also loads plugins, but ordinary **`--headless-script` does not**. Do not assume a plugin command available in the GUI exists in a headless automation job.
+The GUI `--script` form uses the same startup loading. The developer `mydbg_scenarios --headless` vertical-slice runner also loads plugins, but ordinary **`mydbg --headless-script` does not**. Do not assume a plugin command available in the GUI exists in a headless automation job.
 
 There is no directory deduplication, enable/disable manager, hot reload, or unload command. Avoid listing the same plugin through multiple paths. Restart the application to load a changed build; merely replacing a .so does not update callbacks already registered in memory.
 
@@ -73,6 +73,8 @@ set_target_properties(example_plugin PROPERTIES PREFIX "")
 ```
 
 Replace the include path. Build outside an automatically loaded directory, then place the trusted resulting .so in the chosen plugin directory and start mydbg with MYDBG_PLUGIN_PATH pointing there. The host executable exports registry symbols for module resolution. For GUI code you also need matching ImGui headers/build settings; the plugin header is not a separately installed GUI SDK.
+
+`PluginApi.h` exposes shared debugger models without including the engine implementation header. A GUI callback that calls methods on its `LldbEngine &` argument must explicitly include `backend/lldb/LldbEngine.h`.
 
 Enter this in **Debugger console**, not `py run`:
 

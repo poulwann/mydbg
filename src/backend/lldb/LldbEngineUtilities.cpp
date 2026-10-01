@@ -1,6 +1,8 @@
 #include "backend/lldb/LldbEngineInternal.h"
 #include "localization/Localization.h"
 
+#include <rz_asm.h>
+
 namespace debugger::lldb_detail {
 
 using namespace std::chrono_literals;
@@ -296,25 +298,26 @@ std::vector<ElfSymbol> read_elf_symbols(const std::filesystem::path &path) {
         size > bytes.size() - offset) {
       return std::nullopt;
     }
-    return decode_pointer(bytes.data() + offset, static_cast<std::uint32_t>(size),
-                          big_endian ? lldb::eByteOrderBig
-                                     : lldb::eByteOrderLittle);
+    return decode_pointer(
+        bytes.data() + offset, static_cast<std::uint32_t>(size),
+        big_endian ? lldb::eByteOrderBig : lldb::eByteOrderLittle);
   };
   const auto read_required = [&read_value](std::size_t offset,
                                            std::size_t size) -> std::uint64_t {
     return read_value(offset, size).value_or(0);
   };
 
-  const std::size_t header_size = elf64 ? sizeof(Elf64_Ehdr) : sizeof(Elf32_Ehdr);
+  const std::size_t header_size =
+      elf64 ? sizeof(Elf64_Ehdr) : sizeof(Elf32_Ehdr);
   if (bytes.size() < header_size) {
     return symbols;
   }
   const std::size_t section_offset = static_cast<std::size_t>(
       read_required(elf64 ? 0x28 : 0x20, elf64 ? 8 : 4));
-  const std::size_t section_entry = static_cast<std::size_t>(
-      read_required(elf64 ? 0x3A : 0x2E, 2));
-  const std::size_t section_count = static_cast<std::size_t>(
-      read_required(elf64 ? 0x3C : 0x30, 2));
+  const std::size_t section_entry =
+      static_cast<std::size_t>(read_required(elf64 ? 0x3A : 0x2E, 2));
+  const std::size_t section_count =
+      static_cast<std::size_t>(read_required(elf64 ? 0x3C : 0x30, 2));
   if (section_count == 0 || section_entry == 0 ||
       section_offset > bytes.size() ||
       section_entry > bytes.size() - section_offset) {
@@ -357,12 +360,13 @@ std::vector<ElfSymbol> read_elf_symbols(const std::filesystem::path &path) {
     symbols.reserve(std::min<std::size_t>(symbols.size() + count, 131072));
     for (std::size_t item = 0; item < count; ++item) {
       const std::size_t entry = offset + item * symbol_size;
-      const std::uint64_t info = read_required(entry + (elf64 ? 0x04 : 0x0C), 1);
+      const std::uint64_t info =
+          read_required(entry + (elf64 ? 0x04 : 0x0C), 1);
       if ((info & 0xF) != STT_FUNC) {
         continue;
       }
-      const std::size_t name_offset = static_cast<std::size_t>(
-          read_required(entry, 4));
+      const std::size_t name_offset =
+          static_cast<std::size_t>(read_required(entry, 4));
       if (name_offset >= string_size) {
         continue;
       }
@@ -380,8 +384,7 @@ std::vector<ElfSymbol> read_elf_symbols(const std::filesystem::path &path) {
       }
       symbols.push_back(ElfSymbol{
           .name = std::string{name},
-          .value = read_required(entry + (elf64 ? 0x08 : 0x04),
-                                 elf64 ? 8 : 4),
+          .value = read_required(entry + (elf64 ? 0x08 : 0x04), elf64 ? 8 : 4),
       });
     }
   }
@@ -411,9 +414,9 @@ ElfSecurityInfo inspect_elf_security(const std::filesystem::path &path) {
         size > bytes.size() - offset) {
       return std::nullopt;
     }
-    return decode_pointer(bytes.data() + offset, static_cast<std::uint32_t>(size),
-                          big_endian ? lldb::eByteOrderBig
-                                     : lldb::eByteOrderLittle);
+    return decode_pointer(
+        bytes.data() + offset, static_cast<std::uint32_t>(size),
+        big_endian ? lldb::eByteOrderBig : lldb::eByteOrderLittle);
   };
   const auto read_required = [&read_value](std::size_t offset,
                                            std::size_t size) -> std::uint64_t {

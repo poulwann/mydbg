@@ -1,6 +1,5 @@
 #include "app/App.h"
 #include "app/GuiApplication.h"
-#include "app/Headless.h"
 #include "app/ScriptRunner.h"
 #include "localization/Localization.h"
 #include "scripting/PythonHost.h"
@@ -18,24 +17,6 @@ int run(int argc, char **argv) {
   }
   try {
     debugger::scripting::PythonHost python_host;
-    if (argc == 2 && std::strcmp(argv[1], "--headless-keybindings") == 0) {
-      return run_keybinding_headless();
-    }
-    if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--headless") == 0) {
-      return run_headless(argv[2], argc == 4 ? argv[3] : nullptr);
-    }
-    if (argc == 3 && std::strcmp(argv[1], "--headless-condition") == 0) {
-      return run_condition_headless(argv[2]);
-    }
-    if (argc == 3 && std::strcmp(argv[1], "--headless-heap") == 0) {
-      return run_heap_headless(argv[2]);
-    }
-    if (argc == 3 && std::strcmp(argv[1], "--headless-scans") == 0) {
-      return run_scans_headless(argv[2]);
-    }
-    if (argc == 3 && std::strcmp(argv[1], "--headless-intelligence") == 0) {
-      return run_stop_intelligence_headless(argv[2]);
-    }
     if (argc == 3 && std::strcmp(argv[1], "--headless-script") == 0) {
       return run_headless_script(argv[2]);
     }

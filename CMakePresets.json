@@ -18,6 +18,17 @@
       }
     },
     {
+      "name": "native-dev",
+      "displayName": "Native development",
+      "description": "Development tests without QEMU, cross compilers, or symbolic solvers",
+      "inherits": "dev",
+      "binaryDir": "${sourceDir}/build/native-dev",
+      "cacheVariables": {
+        "MYDBG_CROSS_ARCH_TESTS": "OFF",
+        "MYDBG_SYMBOLIC_TESTS": "OFF"
+      }
+    },
+    {
       "name": "system-dev",
       "displayName": "Development with system analysis dependencies",
       "description": "RelWithDebInfo build using system Rizin and rz-ghidra",
@@ -47,6 +58,10 @@
       "configurePreset": "dev"
     },
     {
+      "name": "native-dev",
+      "configurePreset": "native-dev"
+    },
+    {
       "name": "system-dev",
       "configurePreset": "system-dev"
     },
@@ -59,6 +74,16 @@
     {
       "name": "dev",
       "configurePreset": "dev",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "native-dev",
+      "configurePreset": "native-dev",
       "output": {
         "outputOnFailure": true
       },

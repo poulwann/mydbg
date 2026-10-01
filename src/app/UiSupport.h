@@ -18,13 +18,15 @@ struct SessionSnapshot;
 namespace mydbg::app {
 
 struct UiState;
+struct WorkspaceState;
+struct FileDialogState;
 enum class DebugAction : std::size_t;
 enum class AppNavigationTarget;
 
 struct UiPanelSetting {
   const char *name;
   l10n::Key label;
-  bool UiState::*visible;
+  bool WorkspaceState::*visible;
 };
 
 extern const std::array<UiPanelSetting, 8> ui_panel_settings;
@@ -32,8 +34,10 @@ extern const std::array<UiPanelSetting, 8> ui_panel_settings;
 float configured_ui_scale(float fallback);
 float window_display_scale(SDL_Window *window);
 void capture_window_state(SDL_Window *window, UiState &ui);
-void show_executable_dialog(UiState &ui);
-void show_script_dialog(UiState &ui);
+void show_executable_dialog(FileDialogState &files, SDL_Window *window,
+                            const char *initial_path);
+void show_script_dialog(FileDialogState &files, SDL_Window *window,
+                        const char *initial_path);
 float effective_ui_scale(const UiState &ui);
 void apply_ui_style(bool dark, float scale);
 void load_ui_fonts(UiState &ui);

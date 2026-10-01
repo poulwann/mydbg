@@ -1,5 +1,7 @@
 #pragma once
 
+struct SDL_Window;
+
 namespace debugger {
 class LldbEngine;
 struct SessionSnapshot;
@@ -11,17 +13,17 @@ struct ScriptSnapshot;
 
 namespace mydbg::app {
 
-struct UiState;
+struct PythonState;
+struct FileDialogState;
+struct WorkspaceState;
+void arrange_python_debug_workspace();
 
-void dispatch_contextual_shortcuts(
-    const debugger::SessionSnapshot &snapshot, debugger::LldbEngine &engine,
-    debugger::scripting::PythonRuntime &runtime, UiState &ui,
-    const debugger::scripting::ScriptSnapshot &script);
 void draw_python_panel(debugger::scripting::PythonRuntime &runtime,
-                       UiState &ui);
+                       PythonState &state, FileDialogState &files,
+                       const WorkspaceState &workspace, SDL_Window *window);
 void draw_console_panel(const debugger::SessionSnapshot &snapshot,
                         debugger::LldbEngine &engine,
                         debugger::scripting::PythonRuntime &runtime,
-                        UiState &ui, bool control_lease);
+                        PythonState &state, bool control_lease);
 
 } // namespace mydbg::app

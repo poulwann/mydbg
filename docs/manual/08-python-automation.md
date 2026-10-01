@@ -162,7 +162,7 @@ A usable stop requires stopped state, a nonzero selected thread, and a captured 
 
 ## Inspection and mutation API
 
-- `dbg.evaluate(expression, timeout=10.0) -> ExpressionResult`: selected-frame LLDB expression evaluation. May have side effects; not the bounded condition language.
+- `dbg.evaluate(expression, timeout=10.0) -> ExpressionResult`: selected-frame expression evaluation. Bare `$register` references use native register lookup; other expressions use LLDB. May have side effects; not the bounded condition language.
 - `dbg.read_register(name, timeout=10.0) -> int`: unsigned numeric register value; errors if not representable as an integer. A leading `$` is accepted by the fallback lookup.
 - `dbg.write_register(name, value, timeout=10.0) -> None`: write a numeric value.
 - `dbg.read_memory(address, size, timeout=10.0) -> bytes`: exact read from a stopped process.
@@ -171,6 +171,8 @@ A usable stop requires stopped state, a nonzero selected thread, and a captured 
 - `dbg.select_frame(thread_id, frame_index, timeout=10.0) -> None`.
 
 Memory operations require a valid stopped process and a size from 1 through 16,777,216 bytes. Registers, expressions, and frame selection require a valid stopped context. Target register/evaluation support remains architecture/stub dependent.
+
+For big-endian PPC32 targets under QEMU, the current LLDB expression engine can import register values with reversed byte order in compound expressions such as `$pc + 0`. Bare `$pc` lookup and `dbg.read_register("pc")` avoid that provider path. For authoritative register arithmetic on affected targets, read the register and perform the arithmetic in Python; literal expression evaluation is not affected.
 
 For numeric expression use, test for None rather than parsing a display string:
 

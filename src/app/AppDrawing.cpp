@@ -5,6 +5,7 @@
 #include "app/DecompilerPanels.h"
 #include "app/HelpSystem.h"
 #include "app/MemoryPanels.h"
+#include "app/PythonController.h"
 #include "app/PythonPanels.h"
 #include "app/UiSupport.h"
 #include "plugins/PluginApi.h"
@@ -12,6 +13,35 @@
 #include <imgui_internal.h>
 
 namespace mydbg::app {
+
+void dispatch_contextual_shortcuts(
+    const debugger::SessionSnapshot &snapshot, debugger::LldbEngine &engine,
+    debugger::scripting::PythonRuntime &runtime, UiState &ui,
+    const debugger::scripting::ScriptSnapshot &script) {
+  if (!ui.python.window_focused) {
+    const bool control_lease =
+        script.control_lease &&
+        script.debug_state != debugger::scripting::ScriptDebugState::Paused;
+    dispatch_debugger_shortcuts(snapshot, engine, ui, control_lease);
+    return;
+  }
+  if (ui.workspace.keybinding_capture) {
+    return;
+  }
+  constexpr ImGuiInputFlags route = ImGuiInputFlags_RouteGlobal;
+  for (const ScriptActionDefinition &definition : script_actions) {
+    const ImGuiKeyChord binding =
+        ui.workspace.script_keybindings[action_index(definition.action)];
+    if (binding != 0 && ImGui::Shortcut(binding, route) &&
+        script_action_enabled(definition.action, script, ui.python)) {
+      if (execute_script_action(definition.action, script, runtime,
+                                ui.python)) {
+        arrange_python_debug_workspace();
+      }
+      break;
+    }
+  }
+}
 
 void draw_application_workspace(
     const debugger::SessionSnapshot &snapshot,
@@ -50,7 +80,7 @@ void draw_application_workspace(
                         native_views_locked);
 
   place_panel(0.20F, 0.72F, 0.40F, 0.28F);
-  draw_console_panel(snapshot, engine, python, ui, script.control_lease);
+  draw_console_panel(snapshot, engine, python, ui.python, script.control_lease);
 
   ImGui::BeginDisabled(script.control_lease);
   place_panel(0.70F, 0.0F, 0.30F, 0.72F);
@@ -77,7 +107,7 @@ void draw_application_workspace(
   }
   ImGui::EndDisabled();
   place_panel(0.10F, 0.08F, 0.80F, 0.84F);
-  draw_python_panel(python, ui);
+  draw_python_panel(python, ui.python, ui.files, ui.workspace, ui.main_window);
   if (focus_disassembly_on_first_frame) {
     ImGui::SetWindowFocus(l10n::label(l10n::Key::WindowDisassembly));
     focus_disassembly_on_first_frame = false;

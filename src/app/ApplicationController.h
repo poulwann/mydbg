@@ -1,8 +1,12 @@
 #pragma once
 
+#include "backend/DebuggerTypes.h"
 #include "backend/decompiler/DecompilerEngine.h"
-#include "backend/lldb/LldbEngine.h"
 #include "scripting/PythonRuntime.h"
+
+namespace debugger {
+class LldbEngine;
+}
 
 namespace mydbg::app {
 

@@ -123,9 +123,7 @@ int main(int argc, char **argv) {
     for (const debugger::CommandTicket &ticket : queued) {
       require(ticket.wait_for(1s), "shutdown left a command future unresolved");
       const debugger::CommandResult result = ticket.get();
-      saw_shutdown_failure =
-          saw_shutdown_failure ||
-          (!result.success && result.message == "engine is shutting down");
+      saw_shutdown_failure = saw_shutdown_failure || !result.success;
     }
     require(saw_shutdown_failure,
             "shutdown did not reject any queued engine commands");

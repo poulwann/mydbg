@@ -292,16 +292,16 @@ decompiler_context_from_snapshot(const debugger::DecompilerSnapshot &snapshot) {
 void open_decompiler_dialog(UiState &ui, DecompilerDialog dialog,
                             const DecompilerTarget &target,
                             std::string_view initial) {
-  ui.decompiler_target = target;
-  ui.decompiler_dialog = dialog;
-  ui.decompiler_message.clear();
+  ui.decompiler.target = target;
+  ui.decompiler.dialog = dialog;
+  ui.decompiler.message.clear();
   if (dialog == DecompilerDialog::Rename) {
-    std::snprintf(ui.decompiler_name_text.data(),
-                  ui.decompiler_name_text.size(), "%.*s",
+    std::snprintf(ui.decompiler.name_text.data(),
+                  ui.decompiler.name_text.size(), "%.*s",
                   static_cast<int>(initial.size()), initial.data());
   } else {
-    std::snprintf(ui.decompiler_type_text.data(),
-                  ui.decompiler_type_text.size(), "%.*s",
+    std::snprintf(ui.decompiler.type_text.data(),
+                  ui.decompiler.type_text.size(), "%.*s",
                   static_cast<int>(initial.size()), initial.data());
   }
 }
@@ -312,7 +312,7 @@ void set_decompiler_type(debugger::DecompilerEngine &engine, UiState &ui,
                          std::string_view type) {
   const std::string type_text{trim_view(type)};
   if (type_text.empty()) {
-    ui.decompiler_message = l10n::text(l10n::Key::GuiPanelsTypeRequired);
+    ui.decompiler.message = l10n::text(l10n::Key::GuiPanelsTypeRequired);
     return;
   }
   engine.edit(debugger::DecompilerEditRequest{
@@ -332,7 +332,7 @@ void mark_decompiler_string(debugger::DecompilerEngine &decompiler, UiState &ui,
                             const debugger::DecompilerSnapshot &decompiled,
                             const DecompilerTarget &target) {
   if (!target.has_reference_file_address) {
-    ui.decompiler_message =
+    ui.decompiler.message =
         l10n::text(l10n::Key::GuiPanelsTokenAddressUnavailable);
     return;
   }
@@ -348,7 +348,7 @@ void mark_decompiler_string(debugger::DecompilerEngine &decompiler, UiState &ui,
   if (const auto load_address =
           load_address_for_file(snapshot, decompiled.executable_path,
                                 target.reference_file_address)) {
-    follow_memory(engine, ui, *load_address);
+    follow_memory(engine, ui.memory, *load_address);
   }
 }
 
@@ -360,7 +360,7 @@ bool decompiler_apply_edit(debugger::DecompilerEngine &decompiler, UiState &ui,
   if (rename) {
     const std::string new_name{trim_view(text)};
     if (new_name.empty()) {
-      ui.decompiler_message = l10n::text(l10n::Key::GuiPanelsNameRequired);
+      ui.decompiler.message = l10n::text(l10n::Key::GuiPanelsNameRequired);
     } else {
       decompiler.edit(debugger::DecompilerEditRequest{
           .context = decompiler_context_from_snapshot(decompiled),
@@ -375,19 +375,19 @@ bool decompiler_apply_edit(debugger::DecompilerEngine &decompiler, UiState &ui,
     }
   } else {
     set_decompiler_type(decompiler, ui, decompiled, target, text);
-    applied = ui.decompiler_message.empty();
+    applied = ui.decompiler.message.empty();
   }
   return applied;
 }
 
 void decompiler_sync_request(UiState &ui,
                              const debugger::DecompilerSnapshot &decompiled) {
-  if (ui.decompiler_target_serial != decompiled.request_serial) {
-    ui.decompiler_target_serial = decompiled.request_serial;
-    ui.decompiler_target.reset();
-    ui.decompiler_context_target.reset();
-    ui.decompiler_context_load_address.reset();
-    ui.decompiler_dialog = DecompilerDialog::None;
+  if (ui.decompiler.target_serial != decompiled.request_serial) {
+    ui.decompiler.target_serial = decompiled.request_serial;
+    ui.decompiler.target.reset();
+    ui.decompiler.context_target.reset();
+    ui.decompiler.context_load_address.reset();
+    ui.decompiler.dialog = DecompilerDialog::None;
   }
 }
 
@@ -398,7 +398,7 @@ bool decompiler_content_ready(const debugger::SessionSnapshot &snapshot,
          decompiled.generation == snapshot.generation &&
          decompiled.session == snapshot.session &&
          decompiled.analysis_revision == snapshot.session_analysis_revision &&
-         !ui.session_clear.valid() && !control_lease &&
+         !ui.session.clear.valid() && !control_lease &&
          snapshot.state == debugger::SessionState::Stopped;
 }
 
@@ -440,20 +440,21 @@ void decompiler_sync_selection(const debugger::SessionSnapshot &snapshot,
                                const debugger::DecompilerSnapshot &decompiled,
                                UiState &ui,
                                std::optional<std::size_t> selected_line) {
-  if (ui.decompiler_keyboard_function != decompiled.function_file_address ||
-      ui.decompiler_keyboard_cursor != ui.disassembly_cursor ||
-      (ui.decompiler_keyboard_line &&
-       *ui.decompiler_keyboard_line >= decompiled.lines.size())) {
-    ui.decompiler_keyboard_function = decompiled.function_file_address;
-    ui.decompiler_keyboard_line.reset();
-    ui.decompiler_keyboard_span.reset();
+  if (ui.decompiler.keyboard_function != decompiled.function_file_address ||
+      ui.decompiler.keyboard_cursor != ui.navigation.disassembly_cursor ||
+      (ui.decompiler.keyboard_line &&
+       *ui.decompiler.keyboard_line >= decompiled.lines.size())) {
+    ui.decompiler.keyboard_function = decompiled.function_file_address;
+    ui.decompiler.keyboard_line.reset();
+    ui.decompiler.keyboard_span.reset();
   }
-  ui.decompiler_keyboard_cursor = ui.disassembly_cursor;
-  if (ui.navigation_source_restore) {
-    const auto &location = *ui.navigation_source_restore;
-    const auto *module = module_for_address(snapshot, ui.disassembly_cursor);
-    if (location.address != ui.disassembly_cursor) {
-      ui.navigation_source_restore.reset();
+  ui.decompiler.keyboard_cursor = ui.navigation.disassembly_cursor;
+  if (ui.navigation.source_restore) {
+    const auto &location = *ui.navigation.source_restore;
+    const auto *module =
+        module_for_address(snapshot, ui.navigation.disassembly_cursor);
+    if (location.address != ui.navigation.disassembly_cursor) {
+      ui.navigation.source_restore.reset();
     } else if (!decompiled.loading &&
                decompiled.generation == snapshot.generation &&
                location.decompiler_function ==
@@ -462,14 +463,14 @@ void decompiler_sync_selection(const debugger::SessionSnapshot &snapshot,
                module->path == decompiled.executable_path) {
       if (location.decompiler_line &&
           *location.decompiler_line < decompiled.lines.size()) {
-        ui.decompiler_keyboard_line = location.decompiler_line;
-        ui.decompiler_keyboard_span = location.decompiler_span;
+        ui.decompiler.keyboard_line = location.decompiler_line;
+        ui.decompiler.keyboard_span = location.decompiler_span;
       }
-      ui.navigation_source_restore.reset();
+      ui.navigation.source_restore.reset();
     }
   }
-  if (!ui.decompiler_keyboard_line && !decompiled.lines.empty()) {
-    ui.decompiler_keyboard_line = selected_line.value_or(0);
+  if (!ui.decompiler.keyboard_line && !decompiled.lines.empty()) {
+    ui.decompiler.keyboard_line = selected_line.value_or(0);
   }
 }
 
@@ -512,8 +513,8 @@ void decompiler_select_source(const debugger::SessionSnapshot &snapshot,
   if (file_address) {
     if (const auto address = load_address_for_file(
             snapshot, decompiled.executable_path, *file_address)) {
-      ui.disassembly_cursor = *address;
-      ui.decompiler_keyboard_cursor = *address;
+      ui.navigation.disassembly_cursor = *address;
+      ui.decompiler.keyboard_cursor = *address;
     }
   }
 }
@@ -521,12 +522,12 @@ void decompiler_select_source(const debugger::SessionSnapshot &snapshot,
 void decompiler_move_line(const debugger::SessionSnapshot &snapshot,
                           const debugger::DecompilerSnapshot &decompiled,
                           UiState &ui, bool up, bool down) {
-  auto &index = *ui.decompiler_keyboard_line;
+  auto &index = *ui.decompiler.keyboard_line;
   if (up && index > 0)
     --index;
   if (down && index + 1 < decompiled.lines.size())
     ++index;
-  ui.decompiler_keyboard_span.reset();
+  ui.decompiler.keyboard_span.reset();
   decompiler_select_source(snapshot, decompiled, ui, decompiled.lines[index],
                            std::nullopt);
 }
@@ -535,11 +536,11 @@ std::optional<DecompilerNavigationLink> decompiler_update_keyboard_target(
     const debugger::SessionSnapshot &snapshot,
     const debugger::DecompilerSnapshot &decompiled, UiState &ui,
     int direction) {
-  const auto index = *ui.decompiler_keyboard_line;
+  const auto index = *ui.decompiler.keyboard_line;
   const auto keyboard_target =
       decompiler_keyboard_target(snapshot, decompiled, decompiled.lines[index],
-                                 ui.decompiler_keyboard_span, direction);
-  ui.decompiler_keyboard_span = keyboard_target
+                                 ui.decompiler.keyboard_span, direction);
+  ui.decompiler.keyboard_span = keyboard_target
                                     ? std::optional{keyboard_target->character}
                                     : std::nullopt;
   if (direction != 0 && keyboard_target) {
@@ -563,7 +564,7 @@ void decompiler_resolve_hover(const debugger::SessionSnapshot &snapshot,
   }
   if (span.symbol_kind != debugger::DecompilerSymbolKind::None) {
     hovered.target = decompiler_target_from_span(line, span);
-    ui.decompiler_target = hovered.target;
+    ui.decompiler.target = hovered.target;
   } else if (const auto token = address_token_at(line.text, character_index)) {
     hovered.literal_address = token->second;
     DecompilerTarget target;
@@ -581,7 +582,7 @@ void decompiler_resolve_hover(const debugger::SessionSnapshot &snapshot,
     target.cursor_file_address = span.file_address;
     target.has_cursor_file_address = span.has_file_address;
     hovered.target = std::move(target);
-    ui.decompiler_target = hovered.target;
+    ui.decompiler.target = hovered.target;
   }
   hovered.navigation_address = decompiler_navigation_address(
       snapshot, decompiled, line, span, character_index);
@@ -592,20 +593,20 @@ void decompiler_update_context(const debugger::SessionSnapshot &snapshot,
                                UiState &ui,
                                const debugger::DecompiledLine &line,
                                const DecompilerHover &hovered) {
-  ui.decompiler_context_target = hovered.target;
+  ui.decompiler.context_target = hovered.target;
   if (hovered.navigation_address) {
-    ui.decompiler_context_load_address = hovered.navigation_address;
+    ui.decompiler.context_load_address = hovered.navigation_address;
   } else if (hovered.literal_address &&
              navigable_address(snapshot, *hovered.literal_address)) {
-    ui.decompiler_context_load_address = hovered.literal_address;
+    ui.decompiler.context_load_address = hovered.literal_address;
   } else if (hovered.file_address) {
-    ui.decompiler_context_load_address = load_address_for_file(
+    ui.decompiler.context_load_address = load_address_for_file(
         snapshot, decompiled.executable_path, *hovered.file_address);
   } else if (!line.file_addresses.empty()) {
-    ui.decompiler_context_load_address = load_address_for_file(
+    ui.decompiler.context_load_address = load_address_for_file(
         snapshot, decompiled.executable_path, line.file_addresses.front());
   } else {
-    ui.decompiler_context_load_address.reset();
+    ui.decompiler.context_load_address.reset();
   }
 }
 
@@ -620,13 +621,13 @@ void decompiler_request_comment(const debugger::SessionSnapshot &snapshot,
       break;
     }
   }
-  debugger_request_comment_editor(snapshot, ui, load_address, text);
+  debugger_request_comment_editor(snapshot, ui.comments, load_address, text);
 }
 
 void decompiler_clear_selection(UiState &ui) {
-  ui.decompiler_selection_anchor.reset();
-  ui.decompiler_selection_start.reset();
-  ui.decompiler_selection_end.reset();
+  ui.decompiler.selection_anchor.reset();
+  ui.decompiler.selection_start.reset();
+  ui.decompiler.selection_end.reset();
 }
 
 void decompiler_begin_selection(const debugger::SessionSnapshot &snapshot,
@@ -635,19 +636,19 @@ void decompiler_begin_selection(const debugger::SessionSnapshot &snapshot,
                                 const debugger::DecompiledLine &line,
                                 std::size_t index,
                                 std::optional<std::uint64_t> file_address) {
-  ui.decompiler_keyboard_line = index;
-  ui.decompiler_keyboard_span.reset();
+  ui.decompiler.keyboard_line = index;
+  ui.decompiler.keyboard_span.reset();
   decompiler_select_source(snapshot, decompiled, ui, line, file_address);
-  ui.decompiler_selection_anchor = index;
-  ui.decompiler_selection_start = index;
-  ui.decompiler_selection_end = index;
+  ui.decompiler.selection_anchor = index;
+  ui.decompiler.selection_start = index;
+  ui.decompiler.selection_end = index;
 }
 
 void decompiler_extend_selection(UiState &ui, std::size_t index) {
-  ui.decompiler_selection_start =
-      std::min(*ui.decompiler_selection_anchor, index);
-  ui.decompiler_selection_end =
-      std::max(*ui.decompiler_selection_anchor, index);
+  ui.decompiler.selection_start =
+      std::min(*ui.decompiler.selection_anchor, index);
+  ui.decompiler.selection_end =
+      std::max(*ui.decompiler.selection_anchor, index);
 }
 
 } // namespace mydbg::app

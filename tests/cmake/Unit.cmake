@@ -1,0 +1,26 @@
+add_executable(memory_data_tests memory_data.cpp)
+target_link_libraries(memory_data_tests PRIVATE memory_data)
+mydbg_enable_warnings(memory_data_tests)
+mydbg_add_test(NAME memory_data COMMAND memory_data_tests)
+add_executable(python_editor_tests
+  ${PROJECT_SOURCE_DIR}/tests/python_editor.cpp ${PROJECT_SOURCE_DIR}/src/app/PythonSyntax.cpp)
+target_include_directories(python_editor_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(python_editor_tests PRIVATE imgui_text_editor)
+mydbg_enable_warnings(python_editor_tests)
+mydbg_add_test(NAME python_editor COMMAND python_editor_tests)
+add_executable(localization_tests ${PROJECT_SOURCE_DIR}/tests/localization.cpp)
+target_link_libraries(localization_tests PRIVATE localization)
+mydbg_add_test(NAME localization COMMAND localization_tests)
+add_executable(session_store_tests ${PROJECT_SOURCE_DIR}/tests/session_store.cpp)
+target_link_libraries(session_store_tests PRIVATE session_store Threads::Threads)
+mydbg_enable_warnings(session_store_tests)
+set_target_properties(session_store_tests PROPERTIES
+  BUILD_RPATH "${RIZIN_LIBRARY_DIRS}")
+target_link_options(session_store_tests PRIVATE
+  $<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>)
+mydbg_add_test(NAME session_store COMMAND session_store_tests)
+
+add_executable(condition_language_tests condition_language.cpp)
+target_link_libraries(condition_language_tests PRIVATE breakpoint_conditions)
+mydbg_enable_warnings(condition_language_tests)
+mydbg_add_test(NAME condition_language COMMAND condition_language_tests)

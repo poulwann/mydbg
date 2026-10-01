@@ -1,8 +1,11 @@
 #include "app/PythonPanels.h"
-#include "app/AppState.h"
 #include "app/PythonController.h"
+#include "app/PythonEditorState.h"
+#include "app/PythonState.h"
 #include "app/PythonSyntax.h"
 #include "app/UiSupport.h"
+#include "app/WorkspaceState.h"
+#include "backend/DebuggerTypes.h"
 #include "localization/Localization.h"
 #include "scripting/PythonRuntime.h"
 
@@ -135,39 +138,12 @@ void arrange_python_debug_workspace() {
   ImGui::MarkIniSettingsDirty();
 }
 
-void dispatch_contextual_shortcuts(
-    const debugger::SessionSnapshot &snapshot, debugger::LldbEngine &engine,
-    debugger::scripting::PythonRuntime &runtime, UiState &ui,
-    const debugger::scripting::ScriptSnapshot &script) {
-  if (!ui.python_window_focused) {
-    const bool control_lease =
-        script.control_lease &&
-        script.debug_state != debugger::scripting::ScriptDebugState::Paused;
-    dispatch_debugger_shortcuts(snapshot, engine, ui, control_lease);
-    return;
-  }
-  if (ui.keybinding_capture) {
-    return;
-  }
-  constexpr ImGuiInputFlags route = ImGuiInputFlags_RouteGlobal;
-  for (const ScriptActionDefinition &definition : script_actions) {
-    const ImGuiKeyChord binding =
-        ui.script_keybindings[action_index(definition.action)];
-    if (binding != 0 && ImGui::Shortcut(binding, route) &&
-        script_action_enabled(definition.action, script, ui)) {
-      if (execute_script_action(definition.action, script, runtime, ui)) {
-        arrange_python_debug_workspace();
-      }
-      break;
-    }
-  }
-}
-
 bool script_action_button(const char *label, ScriptAction action,
-                          const UiState &ui) {
+                          const WorkspaceState &workspace) {
   const bool activated = ImGui::Button(label);
   if (ImGui::IsItemHovered()) {
-    const ImGuiKeyChord binding = ui.script_keybindings[action_index(action)];
+    const ImGuiKeyChord binding =
+        workspace.script_keybindings[action_index(action)];
     if (binding == 0) {
       ImGui::SetTooltip("%s", l10n::text(l10n::Key::GuiPythonShortcutUnbound));
     } else {
@@ -179,27 +155,29 @@ bool script_action_button(const char *label, ScriptAction action,
 }
 
 void draw_python_panel(debugger::scripting::PythonRuntime &runtime,
-                       UiState &ui) {
-  if (!ui.script_editor_initialized) {
-    ui.script_editor.SetLanguageDefinition(python_language_definition());
-    ui.script_editor.SetTabSize(4);
-    ui.script_editor.SetShowWhitespaces(false);
-    ui.script_editor.SetPalette(python_palette(ui.theme_dark));
-    ui.script_editor_theme_dark = ui.theme_dark;
-    ui.script_editor_initialized = true;
+                       PythonState &state, FileDialogState &files,
+                       const WorkspaceState &workspace, SDL_Window *window) {
+  if (!state.editor_initialized) {
+    state.editor->text.SetLanguageDefinition(python_language_definition());
+    state.editor->text.SetTabSize(4);
+    state.editor->text.SetShowWhitespaces(false);
+    state.editor->text.SetPalette(python_palette(workspace.theme_dark));
+    state.editor_theme_dark = workspace.theme_dark;
+    state.editor_initialized = true;
   }
-  if (ui.script_editor_theme_dark != ui.theme_dark) {
-    ui.script_editor.SetPalette(python_palette(ui.theme_dark));
-    ui.script_editor_theme_dark = ui.theme_dark;
+  if (state.editor_theme_dark != workspace.theme_dark) {
+    state.editor->text.SetPalette(python_palette(workspace.theme_dark));
+    state.editor_theme_dark = workspace.theme_dark;
   }
 
-  const PythonFileDialogState file_dialog = python_sync_script_file(ui);
+  const PythonFileDialogState file_dialog =
+      python_sync_script_file(state, files);
 
   const debugger::scripting::ScriptSnapshot script = runtime.snapshot();
-  python_sync_editor_execution(script, ui);
+  python_sync_editor_execution(script, state);
 
   ImGui::Begin(l10n::label(l10n::Key::WindowPythonDebugger));
-  ui.python_window_focused =
+  state.window_focused =
       ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
   const float button_width =
       ImGui::CalcTextSize(l10n::text(l10n::Key::GuiPythonBrowse)).x +
@@ -208,18 +186,18 @@ void draw_python_panel(debugger::scripting::PythonRuntime &runtime,
       -(button_width * 4.0F + ImGui::GetStyle().ItemSpacing.x * 4.0F));
   ImGui::InputTextWithHint("##python-script",
                            l10n::text(l10n::Key::GuiPythonScriptPathHint),
-                           ui.script_path.data(), ui.script_path.size());
+                           state.path.data(), state.path.size());
   ImGui::SameLine();
   ImGui::BeginDisabled(script.control_lease);
   if (ImGui::Button(l10n::label(l10n::Key::GuiPythonLoad))) {
-    load_script_source(ui, ui.script_path.data());
+    load_script_source(state, state.path.data());
   }
   ImGui::SameLine();
   if (ImGui::Button(l10n::label(l10n::Key::GuiPythonSave)) ||
       (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
        ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_S,
                        ImGuiInputFlags_RouteFocused))) {
-    save_script_source(ui);
+    save_script_source(state);
   }
   ImGui::EndDisabled();
   ImGui::SameLine();
@@ -227,29 +205,29 @@ void draw_python_panel(debugger::scripting::PythonRuntime &runtime,
   if (ImGui::Button(file_dialog.open
                         ? l10n::label(l10n::Key::GuiPythonSelecting)
                         : l10n::label(l10n::Key::GuiPythonBrowse))) {
-    show_script_dialog(ui);
+    show_script_dialog(files, window, state.path.data());
   }
   ImGui::EndDisabled();
   ImGui::SameLine();
   ImGui::BeginDisabled(script.control_lease);
   if (ImGui::Button(l10n::label(l10n::Key::GuiPythonCtfDemo))) {
-    python_load_ctf_demo(runtime, ui);
+    python_load_ctf_demo(runtime, state);
   }
   ImGui::EndDisabled();
 
   const auto action_button = [&](l10n::Key label, ScriptAction action) {
-    if (script_action_button(l10n::label(label), action, ui)) {
-      if (execute_script_action(action, script, runtime, ui)) {
+    if (script_action_button(l10n::label(label), action, workspace)) {
+      if (execute_script_action(action, script, runtime, state)) {
         arrange_python_debug_workspace();
       }
     }
   };
-  ImGui::BeginDisabled(script.control_lease || ui.script_loaded_path.empty());
+  ImGui::BeginDisabled(script.control_lease || state.loaded_path.empty());
   action_button(l10n::Key::GuiPythonRun, ScriptAction::Run);
   ImGui::SameLine();
   if (script_action_button(l10n::label(l10n::Key::GuiPythonDebug),
-                           ScriptAction::DebugContinue, ui)) {
-    if (start_python_debugger(runtime, ui)) {
+                           ScriptAction::DebugContinue, workspace)) {
+    if (start_python_debugger(runtime, state)) {
       arrange_python_debug_workspace();
     }
   }
@@ -283,17 +261,16 @@ void draw_python_panel(debugger::scripting::PythonRuntime &runtime,
     arrange_python_debug_workspace();
   }
 
-  ImGui::Text(l10n::text(ui.script_dirty
-                             ? l10n::Key::GuiPythonModifiedScriptState
-                             : l10n::Key::GuiPythonScriptState),
+  ImGui::Text(l10n::text(state.dirty ? l10n::Key::GuiPythonModifiedScriptState
+                                     : l10n::Key::GuiPythonScriptState),
               script_status_text(script.status),
               script_debug_state_text(script.debug_state));
-  if (!file_dialog.error.empty() || !ui.script_file_error.empty()) {
+  if (!file_dialog.error.empty() || !state.file_error.empty()) {
     const std::string &error =
-        !file_dialog.error.empty() ? file_dialog.error : ui.script_file_error;
+        !file_dialog.error.empty() ? file_dialog.error : state.file_error;
     ImGui::TextColored(ImVec4(1.0F, 0.35F, 0.35F, 1.0F), "%s", error.c_str());
-  } else if (!ui.python_console_message.empty()) {
-    ImGui::TextUnformatted(ui.python_console_message.c_str());
+  } else if (!state.console_message.empty()) {
+    ImGui::TextUnformatted(state.console_message.c_str());
   }
 
   if (ImGui::BeginTable("script-debugger-layout", 2,
@@ -306,16 +283,16 @@ void draw_python_panel(debugger::scripting::PythonRuntime &runtime,
                             ImGuiTableColumnFlags_WidthStretch, 0.32F);
     ImGui::TableNextRow();
     ImGui::TableSetColumnIndex(0);
-    ui.script_editor.Render("##python-source", ImVec2(0.0F, 0.0F), false);
-    if (ui.script_editor.IsTextChanged()) {
-      ui.script_dirty = true;
+    state.editor->text.Render("##python-source", ImVec2(0.0F, 0.0F), false);
+    if (state.editor->text.IsTextChanged()) {
+      state.dirty = true;
     }
 
     ImGui::TableSetColumnIndex(1);
     if (ImGui::BeginTabBar("script-inspector-tabs")) {
       if (ImGui::BeginTabItem(l10n::label(l10n::Key::GuiPythonStack))) {
-        if (ui.selected_script_frame >= script.frames.size()) {
-          ui.selected_script_frame = 0;
+        if (state.selected_frame >= script.frames.size()) {
+          state.selected_frame = 0;
         }
         for (std::size_t index = 0; index < script.frames.size(); ++index) {
           const auto &frame = script.frames[index];
@@ -323,17 +300,16 @@ void draw_python_panel(debugger::scripting::PythonRuntime &runtime,
               frame.function + " — " +
               std::filesystem::path{frame.file}.filename().string() + ":" +
               std::to_string(frame.line);
-          if (ImGui::Selectable(label.c_str(),
-                                ui.selected_script_frame == index)) {
-            ui.selected_script_frame = index;
+          if (ImGui::Selectable(label.c_str(), state.selected_frame == index)) {
+            state.selected_frame = index;
           }
         }
         ImGui::EndTabItem();
       }
       if (ImGui::BeginTabItem(l10n::label(l10n::Key::GuiPythonLocals))) {
-        if (ui.selected_script_frame < script.frames.size()) {
+        if (state.selected_frame < script.frames.size()) {
           draw_script_values("script-locals",
-                             script.frames[ui.selected_script_frame].locals);
+                             script.frames[state.selected_frame].locals);
         }
         ImGui::EndTabItem();
       }
@@ -364,7 +340,7 @@ void draw_python_panel(debugger::scripting::PythonRuntime &runtime,
 void draw_console_panel(const debugger::SessionSnapshot &snapshot,
                         debugger::LldbEngine &engine,
                         debugger::scripting::PythonRuntime &runtime,
-                        UiState &ui, bool control_lease) {
+                        PythonState &state, bool control_lease) {
   ImGui::Begin(l10n::label(l10n::Key::WindowCommand));
   if (ImGui::BeginTabBar("output-tabs")) {
     if (ImGui::BeginTabItem(l10n::label(l10n::Key::GuiPythonDebuggerConsole))) {
@@ -376,16 +352,16 @@ void draw_console_panel(const debugger::SessionSnapshot &snapshot,
       ImGui::EndChild();
       const bool submitted = ImGui::InputTextWithHint(
           "##command", l10n::text(l10n::Key::GuiPythonCommandHint),
-          ui.console_command.data(), ui.console_command.size(),
+          state.console_command.data(), state.console_command.size(),
           ImGuiInputTextFlags_EnterReturnsTrue);
       ImGui::SameLine();
       if (submitted || ImGui::Button(l10n::label(l10n::Key::GuiPythonRun))) {
-        execute_console_input(ui.console_command.data(), engine, runtime, ui,
-                              control_lease);
-        ui.console_command.front() = '\0';
+        execute_console_input(state.console_command.data(), engine, runtime,
+                              state, control_lease);
+        state.console_command.front() = '\0';
       }
-      if (!ui.python_console_message.empty()) {
-        ImGui::TextWrapped("%s", ui.python_console_message.c_str());
+      if (!state.console_message.empty()) {
+        ImGui::TextWrapped("%s", state.console_message.c_str());
       }
       ImGui::EndTabItem();
     }

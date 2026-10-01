@@ -3,6 +3,7 @@
 #include "app/AppState.h"
 #include "app/HelpSystem.h"
 #include "app/UiSupport.h"
+#include "backend/lldb/LldbEngine.h"
 #include "plugins/PluginApi.h"
 
 #include <imgui_internal.h>
@@ -14,22 +15,22 @@ namespace mydbg::app {
 
 void draw_navigation_dialog(const debugger::SessionSnapshot &snapshot,
                             debugger::LldbEngine &engine, UiState &ui) {
-  if (ui.navigation_dialog_requested) {
+  if (ui.navigation.dialog_requested) {
     ImGui::OpenPopup(l10n::label(l10n::Key::GuiSupportNavigateAddress));
-    ui.navigation_dialog_requested = false;
-    ui.navigation_dialog_open = true;
+    ui.navigation.dialog_requested = false;
+    ui.navigation.dialog_open = true;
   }
   ImGui::SetNextWindowSize(ImVec2(480.0F, 0.0F), ImGuiCond_Appearing);
   if (!ImGui::BeginPopupModal(l10n::label(l10n::Key::GuiSupportNavigateAddress),
                               nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
     return;
   }
-  const char *origin = l10n::label(ui.navigation_dialog_decompiler_view
+  const char *origin = l10n::label(ui.navigation.dialog_decompiler_view
                                        ? l10n::Key::WindowDecompiler
                                        : l10n::Key::WindowDisassembly);
-  if (!ui.navigation_dialog_open ||
-      ui.navigation_dialog_generation != snapshot.generation) {
-    ui.navigation_dialog_open = false;
+  if (!ui.navigation.dialog_open ||
+      ui.navigation.dialog_generation != snapshot.generation) {
+    ui.navigation.dialog_open = false;
     ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
     ImGui::SetWindowFocus(origin);
@@ -40,7 +41,7 @@ void draw_navigation_dialog(const debugger::SessionSnapshot &snapshot,
   }
   const bool submitted = ImGui::InputText(
       l10n::label(l10n::Key::GuiSupportNavigationAddress),
-      ui.navigation_address.data(), ui.navigation_address.size(),
+      ui.navigation.address.data(), ui.navigation.address.size(),
       ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
   ImGui::TextWrapped("%s",
                      l10n::text(l10n::Key::GuiSupportNavigationAddressHint));
@@ -50,9 +51,9 @@ void draw_navigation_dialog(const debugger::SessionSnapshot &snapshot,
         ImVec4(1.0F, 0.35F, 0.35F, 1.0F), "%s",
         l10n::text(l10n::Key::GuiSupportNavigationStoppedRequired));
   }
-  if (!ui.navigation_address_error.empty()) {
+  if (!ui.navigation.address_error.empty()) {
     ImGui::TextColored(ImVec4(1.0F, 0.35F, 0.35F, 1.0F), "%s",
-                       ui.navigation_address_error.c_str());
+                       ui.navigation.address_error.c_str());
   }
   const char *focus_after_close = nullptr;
   ImGui::BeginDisabled(!valid_session);
@@ -66,7 +67,7 @@ void draw_navigation_dialog(const debugger::SessionSnapshot &snapshot,
           app_navigation_address_is_code(snapshot, navigation.address);
       focus_after_close =
           code ? origin : l10n::label(l10n::Key::WindowMemoryDump);
-      ui.navigation_dialog_open = false;
+      ui.navigation.dialog_open = false;
       ImGui::CloseCurrentPopup();
     }
   }
@@ -74,8 +75,8 @@ void draw_navigation_dialog(const debugger::SessionSnapshot &snapshot,
   ImGui::SameLine();
   if (ImGui::Button(l10n::label(l10n::Key::GuiSupportCancel)) ||
       ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-    ui.navigation_dialog_open = false;
-    ui.navigation_address_error.clear();
+    ui.navigation.dialog_open = false;
+    ui.navigation.address_error.clear();
     focus_after_close = origin;
     ImGui::CloseCurrentPopup();
   }
@@ -112,7 +113,7 @@ void draw_pointer_context_actions(const debugger::SessionSnapshot &snapshot,
   if (ImGui::MenuItem(l10n::label(l10n::Key::GuiSupportFollowDisassembly)))
     follow_disassembly(engine, ui, address);
   if (ImGui::MenuItem(l10n::label(l10n::Key::GuiSupportFollowMemoryDump)))
-    follow_memory(engine, ui, address);
+    follow_memory(engine, ui.memory, address);
   if (ImGui::MenuItem(l10n::label(l10n::Key::GuiSupportShowMemoryMap)))
     show_in_memory_map(ui, address);
   ImGui::Separator();
@@ -121,9 +122,9 @@ void draw_pointer_context_actions(const debugger::SessionSnapshot &snapshot,
 
 void draw_instruction_patch_editor(const debugger::SessionSnapshot &snapshot,
                                    debugger::LldbEngine &engine, UiState &ui) {
-  if (ui.instruction_patch_editor_requested) {
+  if (ui.patch.editor_requested) {
     ImGui::OpenPopup(l10n::label(l10n::Key::GuiSupportPatchInstruction));
-    ui.instruction_patch_editor_requested = false;
+    ui.patch.editor_requested = false;
   }
   ImGui::SetNextWindowSize(ImVec2(580.0F, 0.0F), ImGuiCond_Appearing);
   if (!ImGui::BeginPopupModal(
@@ -134,18 +135,18 @@ void draw_instruction_patch_editor(const debugger::SessionSnapshot &snapshot,
 
   const bool valid_session = app_instruction_patch_session_valid(snapshot, ui);
   ImGui::Text(l10n::text(l10n::Key::GuiSupportPatchAddress),
-              ui.instruction_patch_address
-                  ? address_specification(*ui.instruction_patch_address).c_str()
+              ui.patch.address
+                  ? address_specification(*ui.patch.address).c_str()
                   : "-");
   ImGui::Text(l10n::text(l10n::Key::GuiSupportOriginalBytes),
-              bytes_as_hex(ui.instruction_patch_original).c_str());
-  const char *label = ui.instruction_patch_assemble
+              bytes_as_hex(ui.patch.original).c_str());
+  const char *label = ui.patch.assemble
                           ? l10n::label(l10n::Key::GuiSupportIntelInstruction)
                           : l10n::label(l10n::Key::GuiSupportHexBytes);
-  const bool submitted = ImGui::InputText(
-      label, ui.instruction_patch_text.data(), ui.instruction_patch_text.size(),
-      ImGuiInputTextFlags_EnterReturnsTrue);
-  if (ui.instruction_patch_assemble) {
+  const bool submitted =
+      ImGui::InputText(label, ui.patch.text.data(), ui.patch.text.size(),
+                       ImGuiInputTextFlags_EnterReturnsTrue);
+  if (ui.patch.assemble) {
     ImGui::TextDisabled("%s",
                         l10n::text(l10n::Key::GuiSupportPatchOverwriteHint));
   } else {
@@ -155,9 +156,9 @@ void draw_instruction_patch_editor(const debugger::SessionSnapshot &snapshot,
     ImGui::TextColored(ImVec4(1.0F, 0.35F, 0.35F, 1.0F), "%s",
                        l10n::text(l10n::Key::GuiSupportPatchStoppedRequired));
   }
-  if (!ui.instruction_patch_error.empty()) {
+  if (!ui.patch.error.empty()) {
     ImGui::TextColored(ImVec4(1.0F, 0.35F, 0.35F, 1.0F), "%s",
-                       ui.instruction_patch_error.c_str());
+                       ui.patch.error.c_str());
   }
 
   ImGui::BeginDisabled(!valid_session);
@@ -189,12 +190,12 @@ void debug_action_menu_item(const char *label, DebugAction action,
 }
 
 void draw_keybindings_settings(UiState &ui) {
-  if (!ui.show_keybindings) {
-    ui.keybinding_capture.reset();
+  if (!ui.workspace.show_keybindings) {
+    ui.workspace.keybinding_capture.reset();
     return;
   }
   if (!ImGui::Begin(l10n::label(l10n::Key::WindowKeybindings),
-                    &ui.show_keybindings)) {
+                    &ui.workspace.show_keybindings)) {
     ImGui::End();
     return;
   }
@@ -205,9 +206,9 @@ void draw_keybindings_settings(UiState &ui) {
   if (ImGui::Button(l10n::label(l10n::Key::GuiSupportRestoreDefaults))) {
     ui_restore_keybindings(ui);
   }
-  if (!ui.keybinding_message.empty()) {
+  if (!ui.workspace.keybinding_message.empty()) {
     ImGui::SameLine();
-    ImGui::TextDisabled("%s", ui.keybinding_message.c_str());
+    ImGui::TextDisabled("%s", ui.workspace.keybinding_message.c_str());
   }
   if (ImGui::BeginTable("keybinding-table", 4,
                         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
@@ -228,16 +229,16 @@ void draw_keybindings_settings(UiState &ui) {
       ImGui::TableSetColumnIndex(1);
       ImGui::TextUnformatted(l10n::text(action.label));
       ImGui::TableSetColumnIndex(2);
-      const bool capturing = ui.keybinding_capture == capture_index;
+      const bool capturing = ui.workspace.keybinding_capture == capture_index;
       const char *binding_text =
           capturing      ? l10n::text(l10n::Key::GuiSupportPressKeys)
           : binding == 0 ? l10n::text(l10n::Key::GuiSupportUnbound)
                          : ImGui::GetKeyChordName(binding);
       const std::string current = std::string{binding_text} + "###binding";
       if (ImGui::Button(current.c_str())) {
-        ui.keybinding_capture = capture_index;
-        ui.keybinding_capture_frame = ImGui::GetFrameCount();
-        ui.keybinding_message.clear();
+        ui.workspace.keybinding_capture = capture_index;
+        ui.workspace.keybinding_capture_frame = ImGui::GetFrameCount();
+        ui.workspace.keybinding_message.clear();
       }
       ImGui::TableSetColumnIndex(3);
       if (action.default_binding == 0) {
@@ -249,16 +250,17 @@ void draw_keybindings_settings(UiState &ui) {
     };
     for (std::size_t index = 0; index < debug_actions.size(); ++index) {
       draw_action(l10n::text(l10n::Key::GuiSupportNativeContext),
-                  debug_actions[index], ui.keybindings[index], index);
+                  debug_actions[index], ui.workspace.keybindings[index], index);
     }
     for (std::size_t index = 0; index < script_actions.size(); ++index) {
       draw_action(l10n::text(l10n::Key::GuiSupportPythonContext),
-                  script_actions[index], ui.script_keybindings[index],
+                  script_actions[index], ui.workspace.script_keybindings[index],
                   debug_actions.size() + index);
     }
     for (std::size_t index = 0; index < navigation_actions.size(); ++index) {
       draw_action(l10n::text(l10n::Key::GuiSupportNavigationContext),
-                  navigation_actions[index], ui.navigation_keybindings[index],
+                  navigation_actions[index],
+                  ui.workspace.navigation_keybindings[index],
                   debug_actions.size() + script_actions.size() + index);
     }
     ImGui::EndTable();
@@ -319,14 +321,15 @@ void draw_debugger_menu(const debugger::SessionSnapshot &snapshot,
   }
   if (ImGui::BeginMenu(l10n::label(l10n::Key::GuiSupportViewMenu))) {
     for (const auto &panel : ui_panel_settings) {
-      ImGui::MenuItem(l10n::label(panel.label), nullptr, &(ui.*panel.visible));
+      ImGui::MenuItem(l10n::label(panel.label), nullptr,
+                      &(ui.workspace.*panel.visible));
     }
     ImGui::EndMenu();
   }
   if (ImGui::BeginMenu(l10n::label(l10n::Key::GuiSupportSettingsMenu))) {
     if (ImGui::BeginMenu(l10n::label(l10n::Key::GuiSupportThemeMenu))) {
       const auto theme_option = [&ui, &engine](const char *label, bool dark) {
-        if (ImGui::MenuItem(label, nullptr, ui.theme_dark == dark)) {
+        if (ImGui::MenuItem(label, nullptr, ui.workspace.theme_dark == dark)) {
           app_select_theme(engine, ui, dark);
           ImGui::MarkIniSettingsDirty();
         }
@@ -337,9 +340,9 @@ void draw_debugger_menu(const debugger::SessionSnapshot &snapshot,
     }
     if (ImGui::BeginMenu(l10n::label(l10n::Key::GuiSupportUiScaleMenu))) {
       const auto scale_option = [&ui](const char *label, float scale) {
-        const bool selected = std::abs(ui.user_scale - scale) < 0.01F;
+        const bool selected = std::abs(ui.workspace.user_scale - scale) < 0.01F;
         if (ImGui::MenuItem(label, nullptr, selected)) {
-          ui.user_scale = scale;
+          ui.workspace.user_scale = scale;
           ImGui::MarkIniSettingsDirty();
         }
       };
@@ -356,16 +359,17 @@ void draw_debugger_menu(const debugger::SessionSnapshot &snapshot,
                    2.5F);
       scale_option(l10n::label(l10n::Key::GuiSupportScaleThreeHundred), 3.0F);
       ImGui::Separator();
-      ImGui::TextDisabled(l10n::text(l10n::Key::GuiSupportScaleSummary),
-                          static_cast<double>(ui.display_scale * 100.0F),
-                          static_cast<double>(effective_ui_scale(ui) * 100.0F));
+      ImGui::TextDisabled(
+          l10n::text(l10n::Key::GuiSupportScaleSummary),
+          static_cast<double>(ui.workspace.display_scale * 100.0F),
+          static_cast<double>(effective_ui_scale(ui) * 100.0F));
       ImGui::EndMenu();
     }
     if (ImGui::BeginMenu(l10n::label(l10n::Key::GuiSupportFontMenu))) {
-      for (const UiFontChoice &choice : ui.fonts) {
+      for (const UiFontChoice &choice : ui.workspace.fonts) {
         if (ImGui::MenuItem(choice.label.c_str(), nullptr,
-                            ui.font_id == choice.id)) {
-          ui.font_id = choice.id;
+                            ui.workspace.font_id == choice.id)) {
+          ui.workspace.font_id = choice.id;
           ImGui::GetIO().FontDefault = choice.font;
           ImGui::MarkIniSettingsDirty();
         }
@@ -373,8 +377,8 @@ void draw_debugger_menu(const debugger::SessionSnapshot &snapshot,
       ImGui::EndMenu();
     }
     if (ImGui::MenuItem(l10n::label(l10n::Key::GuiSupportKeybindingsMenu),
-                        nullptr, &ui.show_keybindings)) {
-      ui.keybinding_message.clear();
+                        nullptr, &ui.workspace.show_keybindings)) {
+      ui.workspace.keybinding_message.clear();
     }
     ImGui::Separator();
     ImGui::TextDisabled(l10n::text(l10n::Key::GuiSupportSettingsSavedIn),

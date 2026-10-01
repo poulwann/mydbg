@@ -1,4 +1,5 @@
 #include "backend/lldb/LldbSessions.h"
+#include "backend/conditions/BreakpointCondition.h"
 #include "backend/lldb/LldbEngineInternal.h"
 #include "localization/Localization.h"
 #include <fcntl.h>
