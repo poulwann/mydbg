@@ -4,6 +4,10 @@ mydbg is a native Linux debugger for ELF executables. LLDB owns process control,
 
 The project is aimed at native debugging, reverse engineering, CTF challenges, and exploit-development workflows. It is currently Linux-only.
 
+[![mydbg debugging the bundled crackme, showing a complete control-flow graph, decompiled code, registers, memory, breakpoints, and the call stack](docs/manual/screenshots/overview.png)](docs/manual/screenshots/overview.png)
+
+*A live session on the bundled [crackme](examples/crackme.cpp), paused in `hash_name`. The complete control-flow graph stays alongside decompilation and live process state. Click the image for full resolution.*
+
 ## Features
 
 - LLDB-backed local launching/PID attach and remote GDB-protocol sessions for `lldb-server`, `gdbserver`, QEMU user, and QEMU system
