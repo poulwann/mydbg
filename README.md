@@ -1,46 +1,42 @@
 # mydbg
 
-A Linux debugger for reverse engineering and exploit work.
+Debugger for reversing ELF files on Linux.
 
-LLDB control, rz-ghidra decompilation, graph disassembly, memory tools, heap inspection, Python automation, symbolic execution, and ROP review — in one workspace.
+LLDB for control. Rizin/rz-ghidra for analysis. ImGui for the workspace. Python, heap tools, patches, scans, symbolic execution, and ROP review live beside the debugger instead of in five separate terminals.
 
-No tab-juggling between debugger, decompiler, memory viewer, scripts, and notes.
-
-## Watch it
+## Video
 
 <video src="rop-review-demo.mp4" controls width="100%"></video>
 
-[Open the ROP review demo](rop-review-demo.mp4)
+[Open video](rop-review-demo.mp4)
 
-[![mydbg workspace overview](docs/manual/screenshots/overview.png)](docs/manual/screenshots/overview.png)
+[![mydbg workspace](docs/manual/screenshots/overview.png)](docs/manual/screenshots/overview.png)
 
-## Why it exists
+## Why
 
-Most debuggers are good at stopping a process.
+Normal debuggers give you registers and a prompt. Reversing needs the rest of the loop:
 
-Reverse engineering needs more:
+- disassemble
+- decompile
+- follow memory
+- patch code
+- inspect heap state
+- script the target
+- run remote/QEMU stubs
+- review ROP chains before trying them
 
-- understand unfamiliar code
-- follow pointers and stack state
-- inspect heap chunks
-- patch instructions
-- decompile hot paths
-- automate the boring parts
-- test exploit ideas without losing context
-- review ROP chains before running them
+mydbg keeps that loop in one UI.
 
-mydbg puts that loop in one native UI.
-
-## Try it
+## Run it
 
 ```console
 ./scripts/build.sh
 ./build/dev/mydbg ./path/to/elf
 ```
 
-The GUI stops new launches at `main`.
+New launches stop at `main`.
 
-```console
+```text
 F9       continue
 F2       breakpoint
 F7/F8    instruction step
@@ -48,48 +44,55 @@ F11/F10  source step
 F1       manual
 ```
 
-## Reverse faster
-
-Disassembly, graph view, decompiler, registers, stack, memory, modules, maps, threads, and backtrace stay in sync.
+## Code view
 
 | Graph | Decompiler |
 | --- | --- |
 | [![Disassembly graph](docs/manual/screenshots/graph.png)](docs/manual/screenshots/graph.png) | [![Decompiler](docs/manual/screenshots/decompiler.png)](docs/manual/screenshots/decompiler.png) |
 
-What you get:
+- linear + graph disassembly
+- rz-ghidra decompiler
+- DWARF names, prototypes, records, source context
+- clickable calls, jumps, pointers
+- navigation history
+- saved comments, symbols, watches, breakpoints, decompiler edits
 
-- linear and graph disassembly
-- clickable calls, jumps, and pointers
-- history for code navigation
-- DWARF names, prototypes, records, and source context
-- saved comments, symbols, watches, breakpoints, and decompiler edits
+## Exploit view
 
-## Exploit workflow
-
-Memory, heap, patching, scans, cyclic patterns, and ROP review are first-class panels.
-
-| ROP review | Heap |
+| ROP | Heap |
 | --- | --- |
 | [![ROP visualizer](docs/manual/screenshots/rop-visualizer.png)](docs/manual/screenshots/rop-visualizer.png) | [![Heap view](docs/manual/screenshots/heap.png)](docs/manual/screenshots/heap.png) |
 
-| Memory | Patch / inspect |
+| Memory | Inspect |
 | --- | --- |
 | [![Memory dump](docs/manual/screenshots/memory.png)](docs/manual/screenshots/memory.png) | [![Inspection view](docs/manual/screenshots/inspection.png)](docs/manual/screenshots/inspection.png) |
 
-ROP review is stack-driven:
+Tools:
+
+- hex/ASCII memory dump
+- memory edits
+- instruction patching
+- Intel syntax assembly
+- string scans
+- typed value scans
+- pointer chains
+- telescope
+- cyclic patterns
+- ELF security
+- glibc heap view
+
+ROP viewer:
 
 - start from a stack slot or `$sp`
-- step instruction by instruction
+- step by instruction or gadget
 - see return edges and stack pivots
-- see register and memory effects in the graph
-- sync Disassembly / Memory dump to the simulated cursor
-- hover for full clipped text
+- see register and memory effects in graph rows
+- sync Disassembly / Memory to the simulated cursor
+- clipped rows stay readable; hover shows full text
 
-The simulator uses captured target state. Reviewing a chain does not step the live process.
+The ROP simulation uses captured state. It does not run the target.
 
-## Script everything
-
-Run Python in the GUI or headless. Debug the script itself when automation gets complex.
+## Python
 
 [![Python debugger](docs/manual/screenshots/python-debug.png)](docs/manual/screenshots/python-debug.png)
 
@@ -98,7 +101,7 @@ Run Python in the GUI or headless. Debug the script itself when automation gets 
 ./build/dev/mydbg --headless-script ./script.py
 ```
 
-Examples ship with the repo:
+Examples:
 
 ```console
 ./build/dev/mydbg --headless-script examples/rop_crackme.py
@@ -106,50 +109,31 @@ Examples ship with the repo:
 ./build/dev/mydbg --headless-script examples/rop_emporium/solve_ret2win_x64.py
 ```
 
-## Local, remote, cross-arch
-
-Use the same workspace for:
+## Targets
 
 - local launch
 - PID attach
 - `lldb-server`
 - `gdbserver`
-- QEMU user-mode stubs
+- QEMU user stubs
 - QEMU system stubs
 
-Pick the profile in **Session**, enter the stub endpoint, and provide the local ELF or symbols.
+Open **Session**, pick the profile, enter the stub endpoint, add the local ELF or symbols.
 
-## What makes it different?
+## Stack
 
-| Job | Built in |
+| Task | Backend |
 | --- | --- |
-| Debug process state | LLDB backend |
-| Understand binaries | Rizin + rz-ghidra |
-| See control flow | linear + graph disassembly |
-| Navigate targets | calls, jumps, pointers, history |
-| Inspect memory | hex, ASCII, typed values, scans |
-| Exploit work | patches, heap, cyclic patterns, ROP review |
-| Automate | embedded Python + headless scripts |
-| Solve paths | optional angr backend |
-| Build chains | optional angrop backend |
-| Cross-arch debugging | QEMU GDB stubs |
-| Keep work | SHA256-keyed sessions |
-
-## Features
-
-- LLDB-backed process control
-- Rizin/rz-ghidra analysis and decompilation
-- synchronized disassembly, registers, stack, memory, modules, maps, threads, backtrace
-- conditional breakpoints
-- instruction patching and Intel-syntax assembly
-- string scans, typed value scans, pointer chains, telescope, cyclic patterns
-- ELF security and glibc heap views
-- Python automation and source-level Python debugger
-- optional angr symbolic execution
-- optional angrop ROP tooling
-- stack-driven ROP visualizer
-- native plugin API
-- built-in manual, themes, keybindings, scaling, persistent layouts, localization catalogs
+| process control | LLDB |
+| binary analysis | Rizin |
+| decompile | rz-ghidra |
+| graph / UI | Dear ImGui |
+| automation | embedded Python |
+| symbolic execution | angr, optional |
+| ROP chains | angrop, optional |
+| emulation | Unicorn + Capstone, optional |
+| remote targets | GDB protocol / QEMU |
+| saved state | executable SHA256 |
 
 ## Build
 
@@ -160,7 +144,7 @@ Linux only.
 ctest --preset dev
 ```
 
-Output:
+Binary:
 
 ```text
 build/dev/mydbg
@@ -173,7 +157,7 @@ nix-shell
 ./scripts/build.sh
 ```
 
-Use existing compatible Rizin/rz-ghidra builds:
+System Rizin/rz-ghidra instead of bootstrapped deps:
 
 ```console
 ./scripts/build.sh --skip-deps
@@ -189,8 +173,6 @@ cmake --build --preset release
 ```
 
 ## Requirements
-
-Runtime/build basics:
 
 - Linux
 - C++20 compiler
@@ -213,7 +195,7 @@ sudo apt install build-essential cmake ninja-build git pkg-config \
   python3 python3-dev python3-venv lldb liblldb-dev libsdl3-dev libgl-dev libpng-dev libbz2-dev
 ```
 
-Full test runs also need `lldb-server`, Clang, LLD, and QEMU user emulators.
+Full tests also need `lldb-server`, Clang, LLD, and QEMU user emulators.
 
 Python must match LLDB:
 
@@ -221,13 +203,13 @@ Python must match LLDB:
 lldb --print-script-interpreter-info
 ```
 
-Override if needed:
+Override:
 
 ```console
 cmake -S . -B build -DPython_EXECUTABLE=/path/to/lldb-compatible-python
 ```
 
-## Optional symbolic / ROP backends
+## Optional symbolic / ROP deps
 
 ```console
 scripts/bootstrap-symbolic.sh
@@ -258,18 +240,18 @@ ctest --preset dev -L python
 ctest --preset dev -L symbolic
 ```
 
-## Repo map
+## Tree
 
 ```text
 src/app/           GUI and panels
 src/backend/lldb/  LLDB engine, commands, QEMU sessions
-src/scripting/     Embedded Python and bindings
-src/plugins/       Native plugin API
+src/scripting/     embedded Python and bindings
+src/plugins/       native plugin API
 locales/en/        English UI strings
-python/mydbg/      Python support package
-docs/manual/       Built-in manual and screenshots
-tests/             Tests, debuggees, scenarios
-examples/          Example targets and scripts
+python/mydbg/      Python package
+docs/manual/       manual and screenshots
+tests/             tests, debuggees, scenarios
+examples/          targets and scripts
 ```
 
 ## Manual
