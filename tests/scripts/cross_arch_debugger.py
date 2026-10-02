@@ -314,11 +314,22 @@ def run(dbg):
     )
 
     before_exit = dbg.snapshot()
-    exited = dbg.continue_and_wait(timeout=20)
-    _require(
-        exited.generation == before_exit.generation,
-        "final continue changed the debug session generation",
-    )
+    terminal = before_exit
+    for _ in range(8):
+        terminal = dbg.continue_and_wait(timeout=20)
+        _require(
+            terminal.generation == before_exit.generation,
+            "final continue changed the debug session generation",
+        )
+        if terminal.state == "exited":
+            break
+        _require_breakpoint_not_hit(
+            terminal,
+            "crackme_failure",
+            challenge_breakpoints["crackme_failure"],
+            "while waiting for process exit",
+        )
+    exited = terminal
     _require(
         exited.revision > before_exit.revision,
         "final continue did not publish a newer snapshot",

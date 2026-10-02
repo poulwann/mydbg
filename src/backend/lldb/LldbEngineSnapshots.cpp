@@ -381,6 +381,91 @@ lldb::addr_t section_end(lldb::SBSection section, lldb::SBTarget &target,
   return end;
 }
 
+struct ResolvedFileAddress {
+  std::uint64_t file_address{};
+  std::uint64_t load_bias{};
+  std::string module_path;
+};
+
+std::optional<ResolvedFileAddress>
+resolve_file_address(lldb::SBSection section, lldb::SBTarget &target,
+                     lldb::addr_t load_address,
+                     const std::string &module_file) {
+  if (!section.IsValid()) {
+    return std::nullopt;
+  }
+  const std::size_t child_count = section.GetNumSubSections();
+  for (std::size_t index = 0; index < child_count; ++index) {
+    if (auto child =
+            resolve_file_address(section.GetSubSectionAtIndex(index), target,
+                                 load_address, module_file)) {
+      return child;
+    }
+  }
+  const lldb::addr_t start = section.GetLoadAddress(target);
+  const lldb::addr_t size = section.GetByteSize();
+  const lldb::addr_t file_address = section.GetFileAddress();
+  if (start == LLDB_INVALID_ADDRESS || file_address == LLDB_INVALID_ADDRESS ||
+      size == 0 || load_address < start || load_address - start >= size ||
+      start < file_address) {
+    return std::nullopt;
+  }
+  const std::uint64_t bias = start - file_address;
+  return ResolvedFileAddress{.file_address = load_address - bias,
+                             .load_bias = bias,
+                             .module_path = module_file};
+}
+
+std::optional<ResolvedFileAddress>
+resolve_file_address(lldb::SBTarget &target, lldb::addr_t load_address) {
+  const std::uint32_t module_count = target.GetNumModules();
+  for (std::uint32_t module_index = 0; module_index < module_count;
+       ++module_index) {
+    lldb::SBModule module = target.GetModuleAtIndex(module_index);
+    const std::string path = module_path(module);
+    if (!module.IsValid() || path.empty()) {
+      continue;
+    }
+    const std::size_t section_count = module.GetNumSections();
+    for (std::size_t section_index = 0; section_index < section_count;
+         ++section_index) {
+      if (auto resolved =
+              resolve_file_address(module.GetSectionAtIndex(section_index),
+                                   target, load_address, path)) {
+        return resolved;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+bool resolve_pc_from_modules(SessionSnapshot &state) {
+  const ModuleInfo *containing_module = nullptr;
+  for (const ModuleInfo &module : state.modules) {
+    if (module.path.empty() || state.pc < module.base ||
+        state.pc >= module.end) {
+      continue;
+    }
+    containing_module = &module;
+    if (module.has_load_bias && state.pc >= module.load_bias) {
+      state.has_pc_file_address = true;
+      state.pc_file_address = state.pc - module.load_bias;
+      state.pc_module_load_bias = module.load_bias;
+      state.pc_module_path = module.path;
+      return true;
+    }
+  }
+  if (containing_module != nullptr && containing_module->base != 0 &&
+      state.pc >= containing_module->base) {
+    state.has_pc_file_address = true;
+    state.pc_file_address = state.pc - containing_module->base;
+    state.pc_module_load_bias = containing_module->base;
+    state.pc_module_path = containing_module->path;
+    return true;
+  }
+  return false;
+}
+
 void capture_threads(lldb::SBProcess &process, SessionSnapshot &state) {
   state.threads.clear();
   const lldb::tid_t selected_thread_id =
@@ -1033,17 +1118,27 @@ void capture_stop(lldb::SBTarget &target, lldb::SBProcess &process,
     }
   }
 
-  lldb::SBAddress pc_address = frameless_mips
-                                   ? target.ResolveLoadAddress(state.pc)
-                                   : frame.GetPCAddress();
-  const lldb::addr_t pc_file_address = pc_address.GetFileAddress();
-  const lldb::addr_t pc_load_address = pc_address.GetLoadAddress(target);
+  lldb::SBAddress pc_address =
+      frameless_mips ? target.ResolveLoadAddress(state.pc) : frame.GetPCAddress();
+  lldb::addr_t pc_file_address = pc_address.GetFileAddress();
+  lldb::addr_t pc_load_address = pc_address.GetLoadAddress(target);
+  if (!pc_address.IsValid() || pc_file_address == LLDB_INVALID_ADDRESS ||
+      pc_load_address == LLDB_INVALID_ADDRESS) {
+    pc_address = target.ResolveLoadAddress(state.pc);
+    pc_file_address = pc_address.GetFileAddress();
+    pc_load_address = pc_address.GetLoadAddress(target);
+  }
   if (pc_file_address != LLDB_INVALID_ADDRESS &&
       pc_load_address != LLDB_INVALID_ADDRESS) {
     state.has_pc_file_address = true;
     state.pc_file_address = pc_file_address;
     state.pc_module_load_bias = pc_load_address - pc_file_address;
     state.pc_module_path = module_path(pc_address.GetModule());
+  } else if (auto resolved = resolve_file_address(target, state.pc)) {
+    state.has_pc_file_address = true;
+    state.pc_file_address = resolved->file_address;
+    state.pc_module_load_bias = resolved->load_bias;
+    state.pc_module_path = resolved->module_path;
   }
 
   if (previous_stop != nullptr) {
@@ -1062,6 +1157,9 @@ void capture_stop(lldb::SBTarget &target, lldb::SBProcess &process,
 
   capture_memory_regions(target, process, state);
   capture_modules(target, state);
+  if (!state.has_pc_file_address) {
+    resolve_pc_from_modules(state);
+  }
   for (RegisterValue &value : state.registers) {
     if (value.has_numeric_value &&
         region_containing(state, value.numeric_value) != nullptr) {

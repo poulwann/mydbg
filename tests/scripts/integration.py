@@ -1,4 +1,18 @@
 import os
+import time
+
+
+def wait_for_new_stop(dbg, previous_stop_revision, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        snapshot = dbg.snapshot()
+        if snapshot.state == "stopped" and snapshot.stop_revision > previous_stop_revision:
+            return snapshot
+        if snapshot.state in ("error", "exited"):
+            return snapshot
+        time.sleep(0.01)
+    raise RuntimeError("timed out waiting for a new stop")
+
 
 module_run_count = globals().get("module_run_count", 0) + 1
 
@@ -27,9 +41,10 @@ def run(dbg):
     dbg.write_register("pc", pc)
     dbg.set_breakpoint("script_checkpoint")
 
+    before_continue = dbg.snapshot()
     dbg.continue_execution()
     process.sendline(b"python\x00payload")
-    stop = dbg.wait_for_stop(timeout=5)
+    stop = wait_for_new_stop(dbg, before_continue.stop_revision, timeout=5)
     ready = process.recvuntil(b"stderr-ready\r\n", timeout=5)
     if b"ready arg=python env=runtime cwd=" not in ready:
         raise RuntimeError(f"missing ready output: {ready!r}")

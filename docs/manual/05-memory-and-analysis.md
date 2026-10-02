@@ -68,6 +68,7 @@ Console equivalents:
 patch ADDRESS 90 90
 assemble ADDRESS mov eax, 1
 patch_list
+patch_save ./patched.elf
 patch_revert ID
 ```
 
@@ -81,7 +82,7 @@ Replace ADDRESS and ID with actual values. These examples **write live memory**;
 - `nop` and `syscall` write fixed instruction encodings for a limited set of architectures. The syscall command writes an instruction; it does not invoke one.
 - Raw LLDB memory writes and the `eb/ew/ed/eq` aliases are not automatically entered in the tracked patch ledger.
 
-The ledger is process-generation state. Restarting clears it, and ordinary memory patches do not modify or persist in the ELF file. Back up binaries before using any separate on-disk patching tools.
+The ledger is process-generation state. Restarting clears it. `patch_save OUTPUT-ELF [MODULE-SUBSTRING]` copies one patched ELF module to a new file and applies every tracked patch that maps to a file-backed `PT_LOAD` segment. Raw LLDB writes are not tracked, so they are not exported. Back up binaries before replacing originals.
 
 ## Typed decompiler hints
 

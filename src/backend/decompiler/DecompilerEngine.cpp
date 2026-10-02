@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <string_view>
+#include <system_error>
 #include <utility>
 
 extern RzCorePlugin rz_core_plugin_ghidra;
@@ -92,6 +93,33 @@ struct CoreHandle {
     return nullptr;
   }
 };
+
+std::filesystem::path executable_directory() {
+  std::error_code error;
+  const auto executable = std::filesystem::read_symlink("/proc/self/exe", error);
+  if (error) {
+    return {};
+  }
+  return executable.parent_path();
+}
+
+const std::string &sleigh_home() {
+  static const std::string home = [] {
+    const auto executable = executable_directory();
+    for (const auto &candidate :
+         {executable / "deps/lib/rizin/plugins/rz_ghidra_sleigh",
+          executable / "deps/lib64/rizin/plugins/rz_ghidra_sleigh"}) {
+      std::error_code error;
+      if (!candidate.empty() &&
+          std::filesystem::is_directory(candidate, error)) {
+        return candidate.string();
+      }
+    }
+    return std::string{MYDBG_SLEIGH_HOME};
+  }();
+  return home;
+}
+
 
 struct LoadedCore {
   DecompilerRequest identity;
@@ -1184,8 +1212,9 @@ void DecompilerEngine::run() {
             l10n::text(l10n::Key::DecompilerGhidraInitializationFailed);
       } else {
         handle.plugin_initialized = true;
+        const auto &sleigh = sleigh_home();
         rz_config_set(handle.core->config, "ghidra.sleighhome",
-                      MYDBG_SLEIGH_HOME);
+                      sleigh.c_str());
         rz_config_set_b(handle.core->config, "bin.dbginfo", false);
         rz_config_set_b(handle.core->config, "bin.dbginfo.debuginfod", false);
         if (!rz_core_file_open_load(handle.core,

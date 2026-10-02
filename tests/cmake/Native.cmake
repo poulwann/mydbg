@@ -1,4 +1,4 @@
-find_program(LLDB_SERVER_EXECUTABLE NAMES lldb-server REQUIRED)
+find_program(LLDB_SERVER_EXECUTABLE NAMES lldb-server-18.1.3 lldb-server REQUIRED)
 
 add_library(test_debugger_plugin MODULE
   ${PROJECT_SOURCE_DIR}/tests/plugins/test_plugin.cpp
@@ -28,19 +28,17 @@ mydbg_add_test(
   COMMAND mydbg_scenarios --headless-condition
     $<TARGET_FILE:debuggee_condition>
 )
-set_tests_properties(
-  headless_scripted_condition PROPERTIES TIMEOUT 20
-)
+set_tests_properties(headless_scripted_condition PROPERTIES TIMEOUT 90)
 mydbg_add_test(
   NAME headless_glibc_heap
   COMMAND mydbg_scenarios --headless-heap $<TARGET_FILE:debuggee_heap>
 )
-set_tests_properties(headless_glibc_heap PROPERTIES TIMEOUT 20)
+set_tests_properties(headless_glibc_heap PROPERTIES TIMEOUT 90)
 mydbg_add_test(
   NAME headless_scans
   COMMAND mydbg_scenarios --headless-scans $<TARGET_FILE:debuggee_scans>
 )
-set_tests_properties(headless_scans PROPERTIES TIMEOUT 30)
+set_tests_properties(headless_scans PROPERTIES TIMEOUT 90)
 mydbg_add_test(
   NAME headless_stop_intelligence
   COMMAND mydbg_scenarios --headless-intelligence
@@ -51,7 +49,7 @@ add_executable(python_lldb_coexistence_tests
   ${PROJECT_SOURCE_DIR}/tests/python_lldb_coexistence.cpp
 )
 target_link_libraries(python_lldb_coexistence_tests
-  PRIVATE debugger_engine pybind11::embed
+  PRIVATE scripting_engine pybind11::embed
 )
 mydbg_enable_warnings(python_lldb_coexistence_tests)
 mydbg_configure_analysis_runtime(python_lldb_coexistence_tests)

@@ -1,6 +1,9 @@
 #include "backend/lldb/LldbInstructionCapture.h"
 #include "backend/lldb/LldbEngineInternal.h"
 #include "localization/Localization.h"
+#if __has_include(<llvm/Config/llvm-config.h>)
+#include <llvm/Config/llvm-config.h>
+#endif
 
 #include <cinttypes>
 #include <rz_analysis.h>
@@ -1266,7 +1269,6 @@ void capture_disassembly_graph(lldb::SBTarget &target,
                                SessionSnapshot &state) {
   constexpr std::size_t maximum_bytes = 64 * 1024;
   constexpr std::size_t maximum_instructions = 4096;
-  constexpr std::uint32_t maximum_ranges = 128;
   constexpr std::size_t fallback_bytes = 4096;
   constexpr std::size_t fallback_instructions = 256;
   auto graph = std::make_shared<DisassemblyGraph>();
@@ -1295,6 +1297,8 @@ void capture_disassembly_graph(lldb::SBTarget &target,
   lldb::SBFunction function = requested.GetFunction();
   if (function.IsValid()) {
     graph->name = safe_string(function.GetName());
+#if defined(LLVM_VERSION_MAJOR) && LLVM_VERSION_MAJOR >= 21
+    constexpr std::uint32_t maximum_ranges = 128;
     lldb::SBAddressRangeList function_ranges = function.GetRanges();
     const std::uint32_t count = function_ranges.GetSize();
     if (count > maximum_ranges) {
@@ -1313,6 +1317,16 @@ void capture_disassembly_graph(lldb::SBTarget &target,
         partial(l10n::text(l10n::Key::SnapshotGraphRangesUnavailable));
       }
     }
+#else
+    const auto start = function.GetStartAddress().GetLoadAddress(target);
+    const auto end = function.GetEndAddress().GetLoadAddress(target);
+    if (start != LLDB_INVALID_ADDRESS && end != LLDB_INVALID_ADDRESS &&
+        start <= requested_address && requested_address < end) {
+      ranges.push_back({start, end});
+    } else {
+      partial(l10n::text(l10n::Key::SnapshotGraphRangesUnavailable));
+    }
+#endif
   }
   if (ranges.empty()) {
     lldb::SBSymbol symbol = requested.GetSymbol();

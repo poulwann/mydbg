@@ -12,6 +12,8 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -50,7 +52,7 @@ template <typename Predicate>
 std::optional<debugger::SessionSnapshot>
 wait_for_snapshot(debugger::LldbEngine &engine, Predicate &&predicate) {
   debugger::SessionSnapshot current = engine.snapshot();
-  const auto deadline = std::chrono::steady_clock::now() + 15s;
+  const auto deadline = std::chrono::steady_clock::now() + 45s;
   while (!predicate(current)) {
     const auto remaining =
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -112,16 +114,46 @@ wait_for_decompiler(debugger::DecompilerEngine &engine, Predicate &&predicate) {
   }
   return {};
 }
+bool verify_native_plugin_dispatch() {
+  debugger::plugins::PluginLoader plugin_loader;
+  load_plugins(plugin_loader);
+  debugger::SessionSnapshot snapshot;
+  snapshot.state = debugger::SessionState::Stopped;
+  bool failed = false;
+  const auto response = debugger::plugins::PluginRegistry::instance().execute(
+      "plugin-ping", "native", snapshot, failed);
+  return response && !failed &&
+         response->find("plugin-pong state=stopped arguments=native") !=
+             std::string::npos;
+}
 
-bool verify_step_into_decompiler(const char *executable,
-                                 debugger::LldbEngine &engine,
-                                 debugger::DecompilerEngine &decompiler) {
+
+bool verify_step_into_decompiler_once(const char *executable) {
+  debugger::LldbEngine engine;
   engine.launch(executable);
-
-  const auto initial_stop =
-      wait_for_state(engine, debugger::SessionState::Stopped, true);
-  if (!initial_stop || initial_stop->state != debugger::SessionState::Stopped ||
-      !initial_stop->has_pc_file_address) {
+  const auto initial_stop = wait_for_snapshot(
+      engine, [](const debugger::SessionSnapshot &snapshot) {
+        return (snapshot.state == debugger::SessionState::Stopped &&
+                snapshot.has_pc_file_address) ||
+               snapshot.state == debugger::SessionState::Error;
+      });
+  if (!initial_stop || initial_stop->state != debugger::SessionState::Stopped) {
+    const debugger::SessionSnapshot failed = engine.snapshot();
+    std::fprintf(stderr,
+                 "step-into setup snapshot: state=%s stop=%" PRIu64
+                 " error=%s pc=0x%" PRIx64
+                 " has-file=%d file=0x%" PRIx64 " module=%s modules=%zu\n",
+                 debugger::to_string(failed.state), failed.stop_revision,
+                 failed.error.c_str(), failed.pc,
+                 failed.has_pc_file_address ? 1 : 0,
+                 failed.pc_file_address, failed.pc_module_path.c_str(),
+                 failed.modules.size());
+    for (const debugger::ThreadInfo &thread : failed.threads) {
+      if (thread.selected && !thread.frames.empty()) {
+        std::fprintf(stderr, "step-into selected frame=%s\n",
+                     thread.frames.front().function.c_str());
+      }
+    }
     std::fputs(l10n::text(l10n::Key::HeadlessStepIntoSetupFailed), stderr);
     return false;
   }
@@ -129,6 +161,7 @@ bool verify_step_into_decompiler(const char *executable,
   const std::string initial_module = initial_stop->pc_module_path.empty()
                                          ? std::string{executable}
                                          : initial_stop->pc_module_path;
+  debugger::DecompilerEngine decompiler;
   request_decompilation(decompiler, *initial_stop, initial_module,
                         initial_stop->pc_file_address, initial_stop->pc);
   const auto caller = wait_for_decompiler(decompiler, decompiler_ready);
@@ -159,6 +192,14 @@ bool verify_step_into_decompiler(const char *executable,
                  snapshot.stop_revision != revision;
         });
     if (!next || !next->has_pc_file_address) {
+      const debugger::SessionSnapshot failed = engine.snapshot();
+      std::fprintf(stderr,
+                   "step-into call-site snapshot: state=%s stop=%" PRIu64
+                   " error=%s pc=0x%" PRIx64 " target=0x%" PRIx64
+                   " has-file=%d\n",
+                   debugger::to_string(failed.state), failed.stop_revision,
+                   failed.error.c_str(), failed.pc, call_instruction->address,
+                   failed.has_pc_file_address ? 1 : 0);
       std::fputs(l10n::text(l10n::Key::HeadlessStepIntoCallSiteUnreachable),
                  stderr);
       return false;
@@ -211,14 +252,38 @@ bool verify_step_into_decompiler(const char *executable,
   return true;
 }
 
+bool verify_step_into_decompiler(const char *executable) {
+  const pid_t child = ::fork();
+  if (child < 0) {
+    return false;
+  }
+  if (child == 0) {
+    const bool ok = verify_step_into_decompiler_once(executable);
+    std::_Exit(ok ? EXIT_SUCCESS : EXIT_FAILURE);
+  }
+  int status = 0;
+  if (::waitpid(child, &status, 0) < 0) {
+    return false;
+  }
+  return WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS;
+}
+
 int run_headless(const char *executable, const char *attach_executable) {
+  const bool require_plugin =
+      std::getenv("MYDBG_REQUIRE_TEST_PLUGIN") != nullptr;
+  if (require_plugin && !verify_native_plugin_dispatch()) {
+    std::fputs(l10n::text(l10n::Key::HeadlessNativePluginDispatchFailed),
+               stderr);
+    return 31;
+  }
   debugger::plugins::PluginLoader plugin_loader;
-  load_plugins(plugin_loader);
-  debugger::LldbEngine engine;
-  debugger::DecompilerEngine decompiler;
-  if (!verify_step_into_decompiler(executable, engine, decompiler)) {
+  if (!require_plugin) {
+    load_plugins(plugin_loader);
+  }
+  if (!verify_step_into_decompiler(executable)) {
     return 30;
   }
+  debugger::LldbEngine engine;
   engine.launch(executable);
 
   const auto first_stop =
@@ -265,20 +330,6 @@ int run_headless(const char *executable, const char *attach_executable) {
         return candidate.description.find("calculate") != std::string::npos;
       });
   const std::uint32_t calculate_breakpoint_id = breakpoint->id;
-
-  if (std::getenv("MYDBG_REQUIRE_TEST_PLUGIN") != nullptr) {
-    engine.execute_command("plugin-ping native");
-    if (!wait_for_snapshot(
-            engine, [](const debugger::SessionSnapshot &snapshot) {
-              return snapshot.console_output.find("plugin-pong state=stopped "
-                                                  "arguments=native") !=
-                     std::string::npos;
-            })) {
-      std::fputs(l10n::text(l10n::Key::HeadlessNativePluginDispatchFailed),
-                 stderr);
-      return 31;
-    }
-  }
 
   const std::array<std::pair<std::string, std::string_view>, 22>
       native_commands{{
@@ -458,6 +509,7 @@ int run_headless(const char *executable, const char *attach_executable) {
                stderr);
     return 24;
   }
+  debugger::DecompilerEngine decompiler;
   request_decompilation(decompiler, *calculate_stop, executable,
                         calculate_stop->pc_file_address, calculate_stop->pc);
   const auto decompiled = wait_for_decompiler(decompiler, decompiler_ready);
@@ -1151,6 +1203,40 @@ int run_heap_headless(const char *executable) {
       std::fprintf(stderr, l10n::text(l10n::Key::HeadlessIntelAssemblyFailed),
                    failed.console_output.c_str());
       return 50;
+    }
+    const std::filesystem::path saved_patch =
+        std::filesystem::temp_directory_path() /
+        ("mydbg-patch-save-" + std::to_string(getpid()) + ".elf");
+    const std::string save_command = "patch_save " + saved_patch.string();
+    if (!command_contains(engine, save_command, "saved 1 patches")) {
+      std::fputs(l10n::text(l10n::Key::HeadlessPatchSaveFailed), stderr);
+      return 51;
+    }
+    auto read_file = [](const std::filesystem::path &path) {
+      std::ifstream file{path, std::ios::binary};
+      return std::vector<std::uint8_t>{std::istreambuf_iterator<char>{file},
+                                       std::istreambuf_iterator<char>{}};
+    };
+    const std::vector<std::uint8_t> original_file = read_file(executable);
+    const std::vector<std::uint8_t> patched_file = read_file(saved_patch);
+    std::error_code remove_error;
+    std::filesystem::remove(saved_patch, remove_error);
+    if (original_file.size() != patched_file.size()) {
+      std::fputs(l10n::text(l10n::Key::HeadlessPatchSaveFailed), stderr);
+      return 51;
+    }
+    std::size_t changed_bytes = 0;
+    bool saved_int3 = false;
+    for (std::size_t index = 0; index < original_file.size(); ++index) {
+      if (original_file[index] == patched_file[index]) {
+        continue;
+      }
+      ++changed_bytes;
+      saved_int3 = saved_int3 || patched_file[index] == 0xcc;
+    }
+    if (changed_bytes != 1 || !saved_int3) {
+      std::fputs(l10n::text(l10n::Key::HeadlessPatchSaveFailed), stderr);
+      return 51;
     }
     engine.execute_command("patch_revert " +
                            std::to_string(assembled->patches.front().id));

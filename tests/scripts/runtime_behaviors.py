@@ -27,7 +27,8 @@ def run(dbg):
     else:
         raise RuntimeError("stale process cursor crossed generations")
 
-    terminal = dbg.continue_and_wait(timeout=5)
+    dbg.continue_execution()
+    terminal = dbg.wait_for_exit(timeout=5)
     if terminal.state != "exited" or terminal.exit_status != 0:
         raise RuntimeError(f"process exit during wait was lost: {terminal.state}")
     print("python-behaviors-ok")

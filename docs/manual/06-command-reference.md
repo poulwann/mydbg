@@ -202,9 +202,10 @@ These commands mutate live target memory. Confirm the address/range and target s
 - `syscall ADDRESS [COUNT]`: write repeated syscall-like encodings, same repetition bound; it does not execute a syscall. Fixed encodings cover a limited x86/AArch64/RISC-V set, not arbitrary target ISA/endian combinations.
 - `patch_list`: list tracked IDs, addresses, originals, and replacements.
 - `patch_revert ID-OR-ADDRESS`: restore one tracked entry by numeric ID/address, report write failure if it cannot be restored.
+- `patch_save OUTPUT-ELF [MODULE-SUBSTRING]`: copy one patched ELF module to a new file and apply every tracked patch that maps to a file-backed `PT_LOAD` segment. Use MODULE-SUBSTRING when patches target a shared object instead of the main executable.
 - `eb ADDRESS VALUES...`, `ew`, `ed`, `eq`: raw LLDB memory writes of 1-, 2-, 4-, or 8-byte units respectively. These are **not tracked** by patch_list.
 
-Tracked overlapping patches preserve the earliest originals. Restart/new generation clears the ledger; none of these operations writes the on-disk ELF. See [memory editing](05-memory-and-analysis.md) for UI behavior and partial-write cautions.
+Tracked overlapping patches preserve the earliest originals. Restart/new generation clears the ledger. `patch_save` exports tracked live-memory edits back to a new ELF file; raw `eb`/`ew`/`ed`/`eq` writes are not tracked and cannot be exported.
 
 ## Maps, modules, ELF sections, and relocations
 

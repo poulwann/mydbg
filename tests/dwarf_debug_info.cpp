@@ -2,6 +2,7 @@
 #include "backend/lldb/LldbEngine.h"
 #include "TestSupport.h"
 
+#include <cstdint>
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -13,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <thread>
 
 using namespace std::chrono_literals;
@@ -41,10 +43,15 @@ public:
   std::filesystem::path path;
 };
 
-void complete(debugger::CommandTicket ticket) {
+debugger::CommandResult completed(debugger::CommandTicket ticket) {
   require(ticket.valid() && ticket.wait_for(20s), "debugger command timed out");
-  const auto result = ticket.get();
+  auto result = ticket.get();
   require(result.success, result.message);
+  return result;
+}
+
+void complete(debugger::CommandTicket ticket) {
+  (void)completed(std::move(ticket));
 }
 
 debugger::SessionSnapshot stopped(debugger::LldbEngine &engine) {
@@ -65,10 +72,58 @@ debugger::SessionSnapshot stopped(debugger::LldbEngine &engine) {
   return snapshot;
 }
 
+std::optional<std::uint64_t>
+module_load_bias_from_image_list(debugger::LldbEngine &engine,
+                                 const std::string &image_name) {
+  const auto result =
+      completed(engine.execute_command("image list \"" + image_name + "\""));
+  const auto base_prefix = result.message.find(" 0x");
+  if (base_prefix == std::string::npos)
+    return std::nullopt;
+  const auto base_start = base_prefix + 1;
+  const auto base_end = result.message.find_first_of(" \t\r\n", base_start);
+  if (base_end == std::string::npos || base_end <= base_start)
+    return std::nullopt;
+  return std::stoull(result.message.substr(base_start, base_end - base_start),
+                     nullptr, 16);
+}
+
+std::uint64_t image_lookup_address(debugger::LldbEngine &engine,
+                                   const std::string &name) {
+  const auto result = completed(engine.execute_command("image lookup -n " + name));
+  const auto address_label = result.message.find("Address:");
+  const auto open = result.message.find('[', address_label);
+  const auto close = result.message.find(']', open);
+  require(address_label != std::string::npos && open != std::string::npos &&
+              close != std::string::npos && close > open + 1,
+          "image lookup did not report a file address for " + name + ": " +
+              result.message);
+  auto image_name = result.message.substr(address_label + 8,
+                                          open - (address_label + 8));
+  const auto first = image_name.find_first_not_of(" \t\r\n");
+  const auto last = image_name.find_last_not_of(" \t\r\n");
+  image_name = first == std::string::npos
+                   ? std::string{}
+                   : image_name.substr(first, last - first + 1);
+  const auto file_address =
+      std::stoull(result.message.substr(open + 1, close - open - 1), nullptr, 16);
+  for (const auto &module : engine.snapshot().modules) {
+    const std::filesystem::path path{module.path};
+    if (module.has_load_bias &&
+        (path.filename() == image_name ||
+         module.path.find(image_name) != std::string::npos))
+      return module.load_bias + file_address;
+  }
+  if (const auto load_bias = module_load_bias_from_image_list(engine, image_name))
+    return *load_bias + file_address;
+  throw std::runtime_error("image lookup found " + name +
+                           " but no relocated module matched " + image_name);
+}
+
 std::uint64_t symbol_address(debugger::LldbEngine &engine,
                              const std::string &name) {
   const auto before = engine.snapshot();
-  complete(engine.set_breakpoint(name));
+  (void)completed(engine.set_breakpoint(name));
   const auto after = engine.snapshot();
   for (const auto &breakpoint : after.breakpoints) {
     if (!breakpoint.addresses.empty() &&
@@ -76,8 +131,36 @@ std::uint64_t symbol_address(debugger::LldbEngine &engine,
                      [&](const auto &old) { return old.id == breakpoint.id; }))
       return breakpoint.addresses.front();
   }
-  throw std::runtime_error("unresolved fixture symbol: " + name);
+  return image_lookup_address(engine, name);
 }
+std::uint64_t runtime_symbol_address(debugger::LldbEngine &engine,
+                                     const std::string &name) {
+  try {
+    return symbol_address(engine, name);
+  } catch (const std::exception &) {
+    const auto before = engine.snapshot();
+    complete(engine.set_breakpoint(name));
+    complete(engine.continue_execution());
+    const auto deadline = std::chrono::steady_clock::now() + 20s;
+    auto snapshot = engine.snapshot();
+    while (snapshot.state != debugger::SessionState::Stopped ||
+           snapshot.stop_revision <= before.stop_revision) {
+      require(snapshot.state != debugger::SessionState::Error &&
+                  snapshot.state != debugger::SessionState::Exited,
+              "fixture failed to stop at " + name + ": " + snapshot.error);
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              deadline - std::chrono::steady_clock::now());
+      require(remaining > 0ms, "fixture timed out stopping at " + name);
+      const auto update = engine.wait_for_update(snapshot.revision, remaining);
+      require(update.has_value(), "fixture stop update timed out for " + name);
+      snapshot = *update;
+    }
+    require(snapshot.pc != 0, "fixture stopped at " + name + " without a PC");
+    return snapshot.pc;
+  }
+}
+
 
 const debugger::InstructionRow &
 instruction_at(const debugger::SessionSnapshot &snapshot,
@@ -180,11 +263,12 @@ void run(const char *executable, std::string_view mode,
   const auto compute = symbol_address(debugger, "dwarf_compute");
   const auto secondary = symbol_address(debugger, "dwarf_secondary");
   const auto inherited = symbol_address(debugger, "dwarf_inherited");
-  const auto scale = symbol_address(debugger, "dwarf_scale");
+
+  const auto browse_stop = stopped(debugger);
   complete(debugger.set_disassembly_graph_enabled(true));
   complete(debugger.read_instructions(compute));
   const auto snapshot = debugger.snapshot();
-  require(snapshot.pc == initial.pc && snapshot.pc != compute,
+  require(snapshot.pc == browse_stop.pc && snapshot.pc != compute,
           "browsing changed the stopped PC");
   const auto &row = instruction_at(snapshot, compute);
   const auto request = request_for(snapshot, row);
@@ -305,7 +389,7 @@ void run(const char *executable, std::string_view mode,
               inherited_text.find("input") != std::string::npos &&
               inherited_text.find("return input") != std::string::npos,
           "abstract-origin return type or parameter was lost");
-
+  const auto scale = runtime_symbol_address(debugger, "dwarf_scale");
   complete(debugger.read_instructions(scale));
   const auto library_snapshot = debugger.snapshot();
   const auto library_request =

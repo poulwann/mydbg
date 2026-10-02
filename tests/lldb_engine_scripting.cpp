@@ -63,7 +63,11 @@ int main(int argc, char **argv) {
     complete(engine.launch(options));
     state = wait_for_state(
         engine, engine.snapshot(), [](const debugger::SessionSnapshot &value) {
-          return value.state == debugger::SessionState::Stopped;
+          return value.state == debugger::SessionState::Stopped &&
+                 std::any_of(value.threads.begin(), value.threads.end(),
+                             [](const debugger::ThreadInfo &thread) {
+                               return thread.selected && !thread.frames.empty();
+                             });
         });
 
     debugger::CommandResult evaluated =

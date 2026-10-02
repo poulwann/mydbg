@@ -18,7 +18,8 @@ namespace debugger::scripting {
 using detail::PythonDebugger;
 using detail::PythonProcess;
 
-PYBIND11_EMBEDDED_MODULE(_mydbg, module) {
+namespace {
+void register_mydbg_module(py::module_ &module) {
   module.def(
       "_text", [](const std::string &key) { return l10n::text_key(key); },
       py::arg("key"));
@@ -93,6 +94,20 @@ PYBIND11_EMBEDDED_MODULE(_mydbg, module) {
       .def("list_breakpoints", &PythonDebugger::list_breakpoints)
       .def("execute", &PythonDebugger::execute, py::arg("command"),
            py::arg("timeout") = 10.0);
+}
+} // namespace
+
+void install_python_bindings() {
+  py::module_ sys = py::module_::import("sys");
+  py::dict modules = sys.attr("modules");
+  if (modules.contains("_mydbg")) {
+    return;
+  }
+  static PyModuleDef definition;
+  py::module_ module =
+      py::module_::create_extension_module("_mydbg", nullptr, &definition);
+  register_mydbg_module(module);
+  modules["_mydbg"] = module;
 }
 
 py::object

@@ -67,7 +67,8 @@ foreach(dwarf_version IN ITEMS 4 5)
         "$<TARGET_FILE:debuggee_dwarf${dwarf_version}_${dwarf_layout}>"
         embedded)
     set_tests_properties("dwarf${dwarf_version}_${dwarf_layout}"
-      PROPERTIES TIMEOUT 90)
+      PROPERTIES TIMEOUT 90
+                 ENVIRONMENT "LLDB_DEBUGSERVER_PATH=${LLDB_SERVER_EXECUTABLE}")
   endforeach()
 endforeach()
 mydbg_add_test(NAME dwarf_debuglink COMMAND dwarf_debug_info_tests
@@ -77,5 +78,6 @@ mydbg_add_test(NAME dwarf_explicit COMMAND dwarf_debug_info_tests
 mydbg_add_test(NAME dwarf_stripped COMMAND dwarf_debug_info_tests
   "${MYDBG_DWARF_STRIPPED_FILE}" stripped)
 set_tests_properties(dwarf_debuglink dwarf_explicit dwarf_stripped
-  PROPERTIES TIMEOUT 90)
+  PROPERTIES TIMEOUT 90
+             ENVIRONMENT "LLDB_DEBUGSERVER_PATH=${LLDB_SERVER_EXECUTABLE}")
 

@@ -1,4 +1,6 @@
 #include "backend/lldb/LldbEngine.h"
+#include "scripting/PythonHost.h"
+
 
 #include <pybind11/embed.h>
 
@@ -29,6 +31,7 @@ void wait_until_ready(debugger::LldbEngine &engine) {
 
 void exercise_once() {
   py::scoped_interpreter interpreter{};
+  debugger::scripting::PythonHost host;
   {
     py::gil_scoped_release release;
     debugger::LldbEngine engine;

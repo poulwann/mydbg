@@ -1,6 +1,10 @@
 #include "scripting/PythonHost.h"
+#include "scripting/PythonBindings.h"
+#include "backend/lldb/LldbEngine.h"
 
-#include <pybind11/embed.h>
+
+
+#include <pybind11/pybind11.h>
 
 #include <memory>
 
@@ -10,15 +14,37 @@ namespace debugger::scripting {
 
 struct PythonHost::Impl {
   Impl() {
-    {
-      py::module_ sys = py::module_::import("sys");
-      sys.attr("path").attr("insert")(0, MYDBG_PYTHON_PACKAGE_DIR);
+    if (Py_IsInitialized() == 0) {
+#if MYDBG_LLDB_LLVM_VERSION_MAJOR > 0 && MYDBG_LLDB_LLVM_VERSION_MAJOR < 21
+      initialize_lldb_runtime();
+#endif
+      if (Py_IsInitialized() == 0) {
+        Py_InitializeEx(1);
+        owns_interpreter = true;
+        install_python_path_and_bindings();
+        release = std::make_unique<py::gil_scoped_release>();
+        return;
+      }
     }
-    release = std::make_unique<py::gil_scoped_release>();
+
+    py::gil_scoped_acquire acquire;
+    install_python_path_and_bindings();
   }
 
+  ~Impl() {
+    release.reset();
+    if (owns_interpreter) {
+      Py_FinalizeEx();
+    }
+  }
 
-  py::scoped_interpreter interpreter{};
+  void install_python_path_and_bindings() {
+    install_python_bindings();
+    py::module_ sys = py::module_::import("sys");
+    sys.attr("path").attr("insert")(0, MYDBG_PYTHON_PACKAGE_DIR);
+  }
+
+  bool owns_interpreter{};
   std::unique_ptr<py::gil_scoped_release> release;
 };
 

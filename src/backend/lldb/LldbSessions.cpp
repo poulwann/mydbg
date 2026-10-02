@@ -2,6 +2,9 @@
 #include "backend/conditions/BreakpointCondition.h"
 #include "backend/lldb/LldbEngineInternal.h"
 #include "localization/Localization.h"
+#if __has_include(<llvm/Config/llvm-config.h>)
+#include <llvm/Config/llvm-config.h>
+#endif
 #include <fcntl.h>
 #include <rz_util/rz_json.h>
 #include <unistd.h>
@@ -170,9 +173,14 @@ void apply_options(lldb::SBBreakpoint &bp, const RzJson *root) {
   bp.SetQueueName(queue.c_str());
   if (const auto *hardware = member(contents, "Hardware");
       hardware && hardware->type == RZ_JSON_BOOLEAN && hardware->num.u_value) {
+#if defined(LLVM_VERSION_MAJOR) && LLVM_VERSION_MAJOR >= 21
     const auto error = bp.SetIsHardware(true);
     if (error.Fail())
       throw std::runtime_error(error_text(error));
+#else
+    throw std::runtime_error(
+        "restoring hardware breakpoints requires LLDB 21 or newer");
+#endif
   }
   if (const auto *names = member(contents, "Names");
       names && names->type == RZ_JSON_ARRAY) {

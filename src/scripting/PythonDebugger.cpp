@@ -181,11 +181,19 @@ void PythonDebugger::terminate(double timeout) {
 }
 
 void PythonDebugger::continue_execution(double timeout) {
+  const SessionSnapshot current = engine_.snapshot();
+  if (current.state == SessionState::Running ||
+      current.state == SessionState::Exited) {
+    return;
+  }
   await(engine_.continue_execution(), timeout_from_seconds(timeout));
 }
 
 PythonSnapshot PythonDebugger::continue_and_wait(double timeout) {
   const SessionSnapshot current = engine_.snapshot();
+  if (current.state != SessionState::Stopped) {
+    return wait_for_next_stop(current, timeout);
+  }
   await(engine_.continue_execution(), timeout_from_seconds(timeout));
   return wait_for_next_stop(current, timeout);
 }

@@ -57,3 +57,7 @@ add_dependencies(mydbg mydbg_manual_assets)
 add_custom_command(TARGET mydbg POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
     "${PROJECT_SOURCE_DIR}/locales" "$<TARGET_FILE_DIR:mydbg>/locales")
+
+install(TARGETS mydbg RUNTIME DESTINATION opt/mydbg)
+install(DIRECTORY "${PROJECT_SOURCE_DIR}/docs/manual" DESTINATION opt/mydbg)
+install(DIRECTORY "${PROJECT_SOURCE_DIR}/locales" DESTINATION opt/mydbg)

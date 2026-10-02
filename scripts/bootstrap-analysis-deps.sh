@@ -57,6 +57,31 @@ if [[ -z "${meson_command}" ]]; then
   fi
   meson_command="${tools_venv}/bin/meson"
 fi
+build_jobs="${CMAKE_BUILD_PARALLEL_LEVEL:-1}"
+submodule_jobs="${MYDBG_SUBMODULE_JOBS:-4}"
+
+run_with_heartbeat() {
+  local description="$1"
+  shift
+  local started
+  started="$(date +%s)"
+  printf '%s\n' "${description}"
+  "$@" &
+  local pid=$!
+  while kill -0 "${pid}" >/dev/null 2>&1; do
+    sleep 60
+    if kill -0 "${pid}" >/dev/null 2>&1; then
+      local now
+      now="$(date +%s)"
+      printf '%s still running after %ss\n' \
+        "${description}" "$((now - started))"
+    fi
+  done
+  wait "${pid}"
+}
+
+
+
 
 checkout_revision() {
   local repository="$1"
@@ -93,7 +118,7 @@ fi
   -Dcli=disabled \
   -Denable_tests=false \
   -Denable_rz_test=false
-"${meson_command}" compile -C "${rizin_build}"
+"${meson_command}" compile -C "${rizin_build}" --jobs "${build_jobs}"
 "${meson_command}" install -C "${rizin_build}"
 
 pkg_config_dirs=()
@@ -114,7 +139,11 @@ checkout_revision \
   "${RZ_GHIDRA_REVISION}" \
   "${rz_ghidra_source}"
 git -C "${rz_ghidra_source}" apply "${repo_root}/patches/rz-ghidra-dwarf-types.patch"
-git -C "${rz_ghidra_source}" submodule update --init --recursive --depth=1
+run_with_heartbeat \
+  "Updating rz-ghidra submodules with shallow recursive fetches..." \
+  git -C "${rz_ghidra_source}" -c progress.delay=1 submodule update \
+    --init --recursive --depth=1 --jobs "${submodule_jobs}" --progress
+printf 'rz-ghidra submodules are ready.\n'
 
 cmake -S "${rz_ghidra_source}" -B "${rz_ghidra_build}" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
@@ -124,7 +153,9 @@ cmake -S "${rz_ghidra_source}" -B "${rz_ghidra_build}" -G Ninja \
   -DBUILD_DECOMPILE_EXECUTABLE=OFF \
   -DBUILD_DECOMPILE_CLI_EXECUTABLE=OFF \
   -DBUILD_SLEIGH_PLUGIN=OFF
-cmake --build "${rz_ghidra_build}" --parallel
+run_with_heartbeat \
+  "Building rz-ghidra plugins..." \
+  cmake --build "${rz_ghidra_build}" --parallel "${build_jobs}"
 cmake --install "${rz_ghidra_build}"
 
 printf '%s\n' "${EXPECTED_STAMP}" >"${stamp_file}"

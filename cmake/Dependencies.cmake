@@ -70,6 +70,15 @@ if(NOT IS_DIRECTORY "${RZ_GHIDRA_SLEIGH_DIR}")
 endif()
 find_path(LLDB_INCLUDE_DIR lldb/API/LLDB.h REQUIRED)
 find_library(LLDB_LIBRARY NAMES lldb REQUIRED)
+set(MYDBG_LLDB_LLVM_VERSION_MAJOR 0)
+if(EXISTS "${LLDB_INCLUDE_DIR}/llvm/Config/llvm-config.h")
+  file(READ "${LLDB_INCLUDE_DIR}/llvm/Config/llvm-config.h" MYDBG_LLVM_CONFIG_HEADER)
+  string(REGEX MATCH "#define[ \t]+LLVM_VERSION_MAJOR[ \t]+([0-9]+)"
+    MYDBG_LLVM_VERSION_MATCH "${MYDBG_LLVM_CONFIG_HEADER}")
+  if(MYDBG_LLVM_VERSION_MATCH)
+    set(MYDBG_LLDB_LLVM_VERSION_MAJOR "${CMAKE_MATCH_1}")
+  endif()
+endif()
 FetchContent_Declare(
   pybind11
   GIT_REPOSITORY https://github.com/pybind/pybind11.git

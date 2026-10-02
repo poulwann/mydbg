@@ -25,7 +25,7 @@ struct LldbRuntime {
   lldb::SBError initialization_error;
 };
 
-const lldb::SBError &initialize_lldb_runtime() {
+const lldb::SBError &lldb_runtime_initialization_error() {
   static LldbRuntime runtime;
   return runtime.initialization_error;
 }
@@ -57,6 +57,8 @@ const char *session_state_display(SessionState state) {
 }
 
 } // namespace
+void initialize_lldb_runtime() { static_cast<void>(lldb_runtime_initialization_error()); }
+
 
 const char *to_string(SessionState state) noexcept {
   switch (state) {
@@ -477,7 +479,7 @@ void LldbEngine::run() {
     published_target_path = state.target_path;
   };
 
-  const lldb::SBError &initialize_error = initialize_lldb_runtime();
+  const lldb::SBError &initialize_error = lldb_runtime_initialization_error();
   if (initialize_error.Fail()) {
     state.state = SessionState::Error;
     state.error = error_text(initialize_error);
@@ -1409,15 +1411,30 @@ void LldbEngine::run() {
       state.error = l10n::text(l10n::Key::EngineNoSelectedThread);
       return command_status.error_detail(state.error);
     }
+    const std::uint64_t previous_pc = state.pc;
+    const std::uint64_t previous_stop_revision = state.stop_revision;
     lldb::SBError step_error;
     thread.StepInstruction(step_over, step_error);
     if (step_error.Fail()) {
       state.error = error_text(step_error);
       return command_status.error_detail(state.error);
     }
-    state.state = SessionState::Running;
-    state.crash = {};
-    state.error.clear();
+    const lldb::StateType native_state = process.GetState();
+    if (is_inspectable_stop(native_state) && process.GetNumThreads() != 0) {
+      instruction_view_address.reset();
+      capture_stop(target, process, memory_view_address,
+                   instruction_view_address, state);
+      if (state.pc != previous_pc &&
+          state.stop_revision <= previous_stop_revision) {
+        state.stop_revision = previous_stop_revision + 1;
+        record_stop_history(state);
+      }
+      refresh_breakpoint_state();
+    } else {
+      state.state = SessionState::Running;
+      state.crash = {};
+      state.error.clear();
+    }
     return step_over ? std::string{l10n::text(l10n::Key::EngineSteppingOver)}
                      : std::string{l10n::text(l10n::Key::EngineSteppingInto)};
   };
@@ -2454,20 +2471,6 @@ void LldbEngine::run() {
         save_session();
         publish();
 
-        if (options.stop_policy == LaunchStopPolicy::Main) {
-          lldb::SBBreakpoint main_breakpoint =
-              target.BreakpointCreateByName("main");
-          if (!main_breakpoint.IsValid()) {
-            state.state = SessionState::Error;
-            state.error = l10n::text(
-                l10n::Key::EngineFailedToCreateTheInitialBreakpointAtMain);
-            publish();
-            break;
-          }
-          main_breakpoint.SetOneShot(true);
-          session.transient(main_breakpoint);
-          refresh_breakpoint_state();
-        }
 
         state.state = SessionState::Launching;
         publish();
@@ -2500,7 +2503,8 @@ void LldbEngine::run() {
         if (!options.working_directory.empty()) {
           launch_info.SetWorkingDirectory(options.working_directory.c_str());
         }
-        if (options.stop_policy == LaunchStopPolicy::Entry) {
+        if (options.stop_policy == LaunchStopPolicy::Entry ||
+            options.stop_policy == LaunchStopPolicy::Main) {
           launch_info.SetLaunchFlags(launch_info.GetLaunchFlags() |
                                      lldb::eLaunchFlagStopAtEntry);
         }
@@ -2518,7 +2522,88 @@ void LldbEngine::run() {
           instruction_view_address.reset();
           capture_stop(target, process, memory_view_address,
                        instruction_view_address, state);
+          session.remove_transients(target);
           refresh_breakpoint_state();
+          if (options.stop_policy == LaunchStopPolicy::Main) {
+            const bool already_at_main = std::ranges::any_of(
+                state.threads, [](const ThreadInfo &thread) {
+                  return thread.selected &&
+                         !thread.frames.empty() &&
+                         thread.frames.front().function == "main";
+                });
+            if (already_at_main) {
+              state.state = SessionState::Stopped;
+              state.error.clear();
+              refresh_breakpoint_state();
+              publish();
+              command_message = l10n::text(l10n::Key::EngineLaunched);
+              break;
+            }
+            lldb::SBBreakpoint main_breakpoint =
+                target.BreakpointCreateByName("main");
+            if (main_breakpoint.IsValid() &&
+                main_breakpoint.GetNumLocations() == 0) {
+              target.BreakpointDelete(main_breakpoint.GetID());
+              main_breakpoint = {};
+            }
+            if (!main_breakpoint.IsValid()) {
+              const auto symbols = read_elf_symbols(state.local_symbol_path);
+              const auto symbol = std::ranges::find_if(
+                  symbols, [](const ElfSymbol &candidate) {
+                    return candidate.name == "main" && candidate.value != 0;
+                  });
+              const auto module = std::ranges::find_if(
+                  state.modules, [&state](const ModuleInfo &candidate) {
+                    return candidate.has_load_bias &&
+                           candidate.path == state.local_symbol_path;
+                  });
+              if (symbol != symbols.end() && module != state.modules.end()) {
+                main_breakpoint = target.BreakpointCreateByAddress(
+                    static_cast<lldb::addr_t>(symbol->value +
+                                              module->load_bias));
+              }
+            }
+            if (main_breakpoint.IsValid()) {
+              bool breakpoint_at_current_pc = false;
+              for (std::size_t index = 0;
+                   index < main_breakpoint.GetNumLocations(); ++index) {
+                lldb::SBBreakpointLocation location =
+                    main_breakpoint.GetLocationAtIndex(
+                        static_cast<std::uint32_t>(index));
+                if (location.GetLoadAddress() == state.pc) {
+                  breakpoint_at_current_pc = true;
+                  break;
+                }
+              }
+              if (breakpoint_at_current_pc) {
+                target.BreakpointDelete(main_breakpoint.GetID());
+                state.state = SessionState::Stopped;
+                state.error.clear();
+                refresh_breakpoint_state();
+                publish();
+                command_message = l10n::text(l10n::Key::EngineLaunched);
+                break;
+              }
+            }
+            if (!main_breakpoint.IsValid()) {
+              state.state = SessionState::Error;
+              state.error = l10n::text(
+                  l10n::Key::EngineFailedToCreateTheInitialBreakpointAtMain);
+            } else {
+              main_breakpoint.SetOneShot(true);
+              session.transient(main_breakpoint);
+              refresh_breakpoint_state();
+              lldb::SBError continue_error = process.Continue();
+              if (continue_error.Fail()) {
+                state.state = SessionState::Error;
+                state.error = error_text(continue_error);
+              } else {
+                state.state = SessionState::Running;
+                state.crash = {};
+                state.error.clear();
+              }
+            }
+          }
         } else {
           state.state = SessionState::Running;
           state.crash = {};
@@ -3120,6 +3205,16 @@ void LldbEngine::run() {
         continue;
       }
       if (is_inspectable_stop(event_state)) {
+        const std::uint64_t event_stop_revision = process.GetStopID();
+        lldb::SBThread event_thread = process.GetSelectedThread();
+        lldb::SBFrame event_frame = event_thread.GetSelectedFrame();
+        const bool unchanged_stop =
+            event_frame.IsValid() && event_frame.GetPC() == state.pc;
+        if (state.state == SessionState::Running &&
+            event_stop_revision != 0 &&
+            event_stop_revision <= state.stop_revision && unchanged_stop) {
+          continue;
+        }
         if (scripted_breakpoint_should_continue()) {
           refresh_breakpoint_state();
           lldb::SBError continue_error = process.Continue();

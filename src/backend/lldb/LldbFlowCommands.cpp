@@ -13,6 +13,15 @@ std::string continue_process(lldb::SBTarget &target, lldb::SBProcess &process,
         l10n::Key::EngineContinueIsOnlyValidWhileTheProcessIsStopped);
     return status.error_detail(state.error);
   }
+  const lldb::StateType native_state = process.GetState();
+  if (native_state == lldb::eStateRunning ||
+      native_state == lldb::eStateStepping) {
+    state.state = SessionState::Running;
+    state.crash = {};
+    state.error.clear();
+    return std::string{l10n::text(l10n::Key::EngineRunning)};
+  }
+
 
   if (is_frameless_qemu_mips_stop(process, state)) {
     const bool at_breakpoint = std::ranges::any_of(

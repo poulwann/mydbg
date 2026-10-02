@@ -1,5 +1,8 @@
 # mydbg
 
+[![CI](https://github.com/poulwann/mydbg/actions/workflows/ci.yml/badge.svg)](https://github.com/poulwann/mydbg/actions/workflows/ci.yml)
+[![Release](https://github.com/poulwann/mydbg/actions/workflows/release.yml/badge.svg)](https://github.com/poulwann/mydbg/actions/workflows/release.yml)
+
 A debugger that feels like a reverse-engineering workbench.
 
 Open an ELF, run it, decompile it, patch it, inspect memory and heap state, script the session, and review ROP chains without leaving the window.
@@ -134,7 +137,9 @@ Open **Session**, pick the profile, enter the stub endpoint, add the local ELF o
 
 ## Build
 
-Linux only.
+Linux only. CI builds and smoke-installs the Ubuntu `.deb`; Debian, Arch Linux, and NixOS use the same source build path below.
+
+Quick path:
 
 ```console
 ./scripts/build.sh
@@ -145,6 +150,24 @@ Binary:
 
 ```text
 build/dev/mydbg
+```
+
+Debian / Ubuntu:
+
+```console
+sudo apt install build-essential cmake ninja-build git pkg-config \
+  python3 python3-dev python3-venv lldb liblldb-dev libsdl3-dev \
+  libgl-dev libpng-dev libbz2-dev
+./scripts/build.sh
+```
+
+If Ubuntu does not ship `libsdl3-dev`, use `./scripts/setup-ubuntu-ci.sh` once before `./scripts/build.sh`; it installs SDL3 into `.deps`.
+
+Arch Linux:
+
+```console
+sudo pacman -S --needed base-devel cmake ninja git pkgconf python lldb sdl3 mesa libpng bzip2
+./scripts/build.sh
 ```
 
 NixOS:
@@ -161,13 +184,17 @@ System Rizin/rz-ghidra instead of bootstrapped deps:
 ctest --preset system-dev
 ```
 
-Release:
+Release package:
 
 ```console
 ./scripts/bootstrap-analysis-deps.sh
-cmake --preset release
+cmake --preset release -DCMAKE_INSTALL_PREFIX=/
 cmake --build --preset release
+cpack --config build/release/CPackConfig.cmake -B dist
+sudo apt install ./dist/*.deb
 ```
+
+Tagged releases run the GitHub release workflow and attach a `.deb` built on Ubuntu.
 
 ## Requirements
 
@@ -181,16 +208,7 @@ cmake --build --preset release
 - SDL3, OpenGL, libpng, bzip2
 - Rizin `rz_core` 0.8.2 and matching rz-ghidra assets
 
-Packages:
-
-```console
-# Arch
-sudo pacman -S --needed base-devel cmake ninja git pkgconf python lldb sdl3 mesa libpng bzip2
-
-# Debian/Ubuntu with SDL3
-sudo apt install build-essential cmake ninja-build git pkg-config \
-  python3 python3-dev python3-venv lldb liblldb-dev libsdl3-dev libgl-dev libpng-dev libbz2-dev
-```
+Ubuntu 24.04 packages LLDB as `lldb-18` / `liblldb-18-dev`; use the matching versioned pair if the unversioned packages are unavailable.
 
 Full tests also need `lldb-server`, Clang, LLD, and QEMU user emulators.
 

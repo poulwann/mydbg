@@ -5,6 +5,112 @@
 
 namespace debugger::lldb_detail {
 
+std::optional<std::uint64_t> file_offset_for_address(
+    const BinaryImage &image, std::uint64_t file_address,
+    std::size_t patch_size) {
+  const auto segment = std::find_if(
+      image.load_segments.begin(), image.load_segments.end(),
+      [file_address, patch_size](const ElfLoadSegment &candidate) {
+        if (file_address < candidate.virtual_address) {
+          return false;
+        }
+        const std::uint64_t delta = file_address - candidate.virtual_address;
+        return delta <= candidate.file_size &&
+               patch_size <= candidate.file_size - delta;
+      });
+  if (segment == image.load_segments.end()) {
+    return std::nullopt;
+  }
+  return segment->file_offset + (file_address - segment->virtual_address);
+}
+
+const ModuleInfo *module_for_patch(const SessionSnapshot &state,
+                                   const PatchInfo &patch,
+                                   std::string_view filter) {
+  const std::uint64_t patch_end = patch.address + patch.replacement.size();
+  const auto module =
+      std::find_if(state.modules.begin(), state.modules.end(),
+                   [&](const ModuleInfo &candidate) {
+                     if (!candidate.has_load_bias || candidate.path.empty() ||
+                         (!filter.empty() &&
+                          candidate.path.find(filter) == std::string::npos)) {
+                       return false;
+                     }
+                     return patch.address >= candidate.base &&
+                            patch.address <= candidate.end &&
+                            patch_end >= patch.address &&
+                            patch_end <= candidate.end;
+                   });
+  return module == state.modules.end() ? nullptr : &*module;
+}
+
+std::string save_patches_to_file(const std::vector<PatchInfo> &patches,
+                                 const SessionSnapshot &state,
+                                 const std::filesystem::path &output_path,
+                                 std::string_view module_filter,
+                                 bool &failed) {
+  NativeCommandStatus status{failed};
+  if (patches.empty()) {
+    return status.error_response(l10n::text(l10n::Key::EngineNoActivePatches));
+  }
+  const ModuleInfo *selected_module = nullptr;
+  for (const PatchInfo &patch : patches) {
+    const ModuleInfo *module = module_for_patch(state, patch, module_filter);
+    if (module == nullptr) {
+      return status.error_response(
+          l10n::text(l10n::Key::EngineErrorPatchHasNoFileBackedElfSegment));
+    }
+    if (selected_module == nullptr) {
+      selected_module = module;
+    } else if (selected_module->path != module->path) {
+      return status.error_response(
+          l10n::text(l10n::Key::EngineErrorPatchSaveSingleModuleOnly));
+    }
+  }
+  if (selected_module == nullptr) {
+    return status.error_response(
+        l10n::text(l10n::Key::EngineErrorPatchHasNoFileBackedElfSegment));
+  }
+  std::string error;
+  auto image = read_binary_image(selected_module->path, error);
+  if (!image) {
+    return status.error_detail(error);
+  }
+  for (const PatchInfo &patch : patches) {
+    if (patch.address < selected_module->load_bias) {
+      return status.error_response(
+          l10n::text(l10n::Key::EngineErrorPatchHasNoFileBackedElfSegment));
+    }
+    const std::uint64_t file_address =
+        patch.address - selected_module->load_bias;
+    const auto file_offset =
+        file_offset_for_address(*image, file_address, patch.replacement.size());
+    if (!file_offset ||
+        *file_offset > image->bytes.size() ||
+        patch.replacement.size() > image->bytes.size() - *file_offset) {
+      return status.error_response(
+          l10n::text(l10n::Key::EngineErrorPatchHasNoFileBackedElfSegment));
+    }
+    std::copy(patch.replacement.begin(), patch.replacement.end(),
+              image->bytes.begin() +
+                  static_cast<std::ptrdiff_t>(*file_offset));
+  }
+  std::ofstream output{output_path, std::ios::binary | std::ios::trunc};
+  if (!output) {
+    return status.error_response(
+        l10n::text(l10n::Key::EngineErrorPatchSaveOpenFailed));
+  }
+  output.write(reinterpret_cast<const char *>(image->bytes.data()),
+               static_cast<std::streamsize>(image->bytes.size()));
+  if (!output) {
+    return status.error_response(
+        l10n::text(l10n::Key::EngineErrorPatchSaveWriteFailed));
+  }
+  const std::string output_name = output_path.string();
+  return l10n::format(l10n::Key::EnginePatchSavedToFile, patches.size(),
+                      output_name.c_str());
+}
+
 std::string
 PatchCommands::apply_patch(lldb::addr_t address,
                            const std::vector<std::uint8_t> &replacement,
@@ -223,6 +329,16 @@ PatchCommands::execute(std::string_view command, std::string_view arguments,
     response = patches.str();
     if (response.empty()) {
       response = l10n::text(l10n::Key::EngineNoActivePatches);
+    }
+  } else if (command == "patch_save") {
+    const std::vector<std::string> values = split_arguments(arguments);
+    if (values.empty()) {
+      response = l10n::text(l10n::Key::EngineUsagePatchSaveOutputElfModule);
+    } else {
+      response = save_patches_to_file(
+          state.patches, state, values[0],
+          values.size() > 1 ? std::string_view{values[1]} : std::string_view{},
+          failed);
     }
   } else if (command == "patch_revert") {
     const auto requested = parse_integer(arguments);

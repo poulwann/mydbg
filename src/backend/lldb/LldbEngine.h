@@ -19,6 +19,8 @@
 #include <vector>
 
 namespace debugger {
+void initialize_lldb_runtime();
+
 
 class LldbEngine final {
 public:

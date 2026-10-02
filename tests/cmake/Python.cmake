@@ -15,7 +15,10 @@ mydbg_add_test(
   COMMAND python_cross_arch_tests "${MYDBG_CROSS_ARCH_SCRIPT}"
     --native x86_64 $<TARGET_FILE:debuggee_crackme_x86_64> CTF!
 )
-set_tests_properties(python_cross_x86_64 PROPERTIES TIMEOUT 120)
+set_tests_properties(python_cross_x86_64 PROPERTIES
+  TIMEOUT 120
+  ENVIRONMENT "LLDB_DEBUGSERVER_PATH=${LLDB_SERVER_EXECUTABLE}"
+)
 
 add_executable(lldb_engine_scripting_tests
   ${PROJECT_SOURCE_DIR}/tests/lldb_engine_scripting.cpp
@@ -30,7 +33,10 @@ mydbg_add_test(
     $<TARGET_FILE:debuggee_attach>
     $<TARGET_FILE_DIR:debuggee_interactive>
 )
-set_tests_properties(lldb_engine_scripting PROPERTIES TIMEOUT 45)
+set_tests_properties(lldb_engine_scripting PROPERTIES
+  TIMEOUT 45
+  ENVIRONMENT "LLDB_DEBUGSERVER_PATH=${LLDB_SERVER_EXECUTABLE}"
+)
 add_executable(python_runtime_tests
   ${PROJECT_SOURCE_DIR}/tests/python_runtime.cpp
 )
@@ -50,7 +56,7 @@ mydbg_add_test(
 set_tests_properties(python_runtime PROPERTIES
   TIMEOUT 75
   ENVIRONMENT
-    "MYDBG_TEST_INTERACTIVE=$<TARGET_FILE:debuggee_interactive>;MYDBG_TEST_WORKING_DIRECTORY=$<TARGET_FILE_DIR:debuggee_interactive>;MYDBG_TEST_ATTACH=$<TARGET_FILE:debuggee_attach>;MYDBG_TEST_BASIC=$<TARGET_FILE:debuggee_basic>"
+    "LLDB_DEBUGSERVER_PATH=${LLDB_SERVER_EXECUTABLE};MYDBG_TEST_INTERACTIVE=$<TARGET_FILE:debuggee_interactive>;MYDBG_TEST_WORKING_DIRECTORY=$<TARGET_FILE_DIR:debuggee_interactive>;MYDBG_TEST_ATTACH=$<TARGET_FILE:debuggee_attach>;MYDBG_TEST_BASIC=$<TARGET_FILE:debuggee_basic>"
 )
 mydbg_add_test(
   NAME ctf_script_demo
@@ -60,7 +66,7 @@ mydbg_add_test(
 set_tests_properties(ctf_script_demo PROPERTIES
   TIMEOUT 30
   ENVIRONMENT
-    "MYDBG_CTF_CHALLENGE=$<TARGET_FILE:ctf_challenge>"
+    "LLDB_DEBUGSERVER_PATH=${LLDB_SERVER_EXECUTABLE};MYDBG_CTF_CHALLENGE=$<TARGET_FILE:ctf_challenge>"
   PASS_REGULAR_EXPRESSION
     "flag\\{scripted_debuggers_turn_runtime_state_into_answers\\}"
 )
