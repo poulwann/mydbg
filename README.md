@@ -1,8 +1,8 @@
 # mydbg
 
-Debugger for reversing ELF files on Linux.
+A debugger that feels like a reverse-engineering workbench.
 
-LLDB for control. Rizin/rz-ghidra for analysis. ImGui for the workspace. Python, heap tools, patches, scans, symbolic execution, and ROP review live beside the debugger instead of in five separate terminals.
+Open an ELF, run it, decompile it, patch it, inspect memory and heap state, script the session, and review ROP chains without leaving the window.
 
 ## Video
 
@@ -12,20 +12,17 @@ LLDB for control. Rizin/rz-ghidra for analysis. ImGui for the workspace. Python,
 
 [![mydbg workspace](docs/manual/screenshots/overview.png)](docs/manual/screenshots/overview.png)
 
-## Why
+## Overview
 
-Normal debuggers give you registers and a prompt. Reversing needs the rest of the loop:
+For CTFs, exploit dev, and binary reversing:
 
-- disassemble
-- decompile
-- follow memory
-- patch code
-- inspect heap state
-- script the target
-- run remote/QEMU stubs
-- review ROP chains before trying them
-
-mydbg keeps that loop in one UI.
+- debugger + decompiler in the same layout
+- graph view when linear disassembly gets annoying
+- memory, stack, heap, modules, maps, threads, backtrace
+- patches, scans, pointer chains, telescope, cyclic patterns
+- Python when clicking becomes repetitive
+- remote and QEMU targets
+- ROP review before you run the payload
 
 ## Run it
 
