@@ -6,6 +6,7 @@
 #include "app/MemoryState.h"
 #include "app/NavigationState.h"
 #include "app/PythonState.h"
+#include "app/RopState.h"
 #include "app/WorkspaceState.h"
 
 struct SDL_Window;
@@ -22,6 +23,7 @@ struct UiState {
   DecompilerState decompiler;
   FileDialogState files;
   PythonState python;
+  RopState rop;
   WorkspaceState workspace;
   NavigationState navigation;
   ScanState scans;

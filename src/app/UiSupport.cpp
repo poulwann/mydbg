@@ -16,7 +16,7 @@
 
 namespace mydbg::app {
 
-const std::array<UiPanelSetting, 8> ui_panel_settings{{
+const std::array<UiPanelSetting, 9> ui_panel_settings{{
     {"ShowThreads", l10n::Key::WindowThreads, &WorkspaceState::show_threads},
     {"ShowBacktrace", l10n::Key::WindowBacktrace,
      &WorkspaceState::show_backtrace},
@@ -28,6 +28,7 @@ const std::array<UiPanelSetting, 8> ui_panel_settings{{
      &WorkspaceState::show_security},
     {"ShowHeap", l10n::Key::WindowGlibcHeap, &WorkspaceState::show_heap},
     {"ShowScans", l10n::Key::WindowScans, &WorkspaceState::show_scans},
+    {"ShowRop", l10n::Key::WindowRop, &WorkspaceState::show_rop},
 }};
 
 constexpr float minimum_ui_scale = 0.75F;

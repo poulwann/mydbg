@@ -198,6 +198,7 @@ struct WorkspaceState {
   bool show_security{};
   bool show_heap{};
   bool show_scans{true};
+  bool show_rop{};
   bool applied_dark_theme{true};
   float display_scale{1.0F};
   float user_scale{1.0F};

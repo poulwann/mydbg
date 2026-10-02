@@ -1,6 +1,7 @@
 add_library(scripting_engine STATIC
   PythonHost.cpp
   PythonRuntime.cpp
+  PythonRopTrace.cpp
   PythonBindings.cpp
   PythonBindingTypes.cpp
   PythonDebugger.cpp)

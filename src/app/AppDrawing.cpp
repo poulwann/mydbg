@@ -7,6 +7,7 @@
 #include "app/MemoryPanels.h"
 #include "app/PythonController.h"
 #include "app/PythonPanels.h"
+#include "app/RopPanel.h"
 #include "app/UiSupport.h"
 #include "plugins/PluginApi.h"
 
@@ -18,6 +19,9 @@ void dispatch_contextual_shortcuts(
     const debugger::SessionSnapshot &snapshot, debugger::LldbEngine &engine,
     debugger::scripting::PythonRuntime &runtime, UiState &ui,
     const debugger::scripting::ScriptSnapshot &script) {
+  if (ui.workspace.show_rop && ui.rop.window_focused) {
+    return;
+  }
   if (!ui.python.window_focused) {
     const bool control_lease =
         script.control_lease &&
@@ -108,6 +112,8 @@ void draw_application_workspace(
   ImGui::EndDisabled();
   place_panel(0.10F, 0.08F, 0.80F, 0.84F);
   draw_python_panel(python, ui.python, ui.files, ui.workspace, ui.main_window);
+  place_panel(0.08F, 0.06F, 0.84F, 0.88F);
+  draw_rop_panel(snapshot, engine, python, ui, script.control_lease);
   if (focus_disassembly_on_first_frame) {
     ImGui::SetWindowFocus(l10n::label(l10n::Key::WindowDisassembly));
     focus_disassembly_on_first_frame = false;

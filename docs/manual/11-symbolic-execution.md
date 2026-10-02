@@ -1,9 +1,9 @@
 # Symbolic Execution and ROP
 
-mydbg integrates symbolic execution (angr) and ROP chain tooling (angrop) as
-optional, script-first backends. The GUI and console bootstrap scripts; the
-reverser owns and iterates on them. Every helper here runs inside mydbg's
-embedded Python, on live debugger state.
+mydbg integrates symbolic execution (angr), script-driven ROP chain tooling
+(angrop), and a graphical stack-driven ROP simulator (Unicorn/Capstone).
+These optional backends run inside mydbg's embedded Python. The visualizer
+captures a stopped target but executes only in an isolated emulator.
 
 ## Installing the backend
 
@@ -12,13 +12,16 @@ The backend needs the interpreter LLDB itself uses:
 ```console
 ./scripts/bootstrap-symbolic.sh
 export MYDBG_SYMBOLIC_PYTHONPATH=$PWD/.venv-symbolic/lib/python3.14/site-packages
+export PYTHONPATH="$MYDBG_SYMBOLIC_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
 The script queries `lldb --print-script-interpreter-info`, creates
 `.venv-symbolic` with that interpreter, and installs the pinned ecosystem
-(`requirements-symbolic.txt`: angr 9.2.223, angrop 9.2.12.post3). Without it,
-`mydbg.symbolic.requires_angr()` returns False and the symbolic features
-report a diagnostic instead of failing mysteriously.
+(`requirements-symbolic.txt`: angr 9.2.223, angrop 9.2.12.post3,
+Unicorn 2.1.4, Capstone 5.0.6). Use the site-packages directory matching that
+interpreter; the example above uses Python 3.14. `PYTHONPATH` exposes the
+backends to the GUI and embedded scripts; `MYDBG_SYMBOLIC_PYTHONPATH` also
+configures the test wrappers. Missing dependencies produce a diagnostic.
 
 ## Symbolic execution from a stopped PC
 
@@ -259,6 +262,112 @@ Findings worth knowing before you script your own:
   debugger. split's solve verifies the chain with `puts` and documents the
   payload for `system`.
 
+## Stack-driven ROP visualizer
+
+![A captured ROP chain with repeated gadgets, a stack pivot, and simulated state](screenshots/rop-visualizer.png)
+
+1. Stop an x86-64 or supported Linux i386 target with the proposed chain in
+   readable memory.
+2. Open **View > ROP visualizer**. Enter the **address of the first stack
+   slot**, in hexadecimal, or use `$sp` / **Use SP**.
+   Alternatively, right-click a Memory dump selection or a Stack telescope
+   **slot address**, then choose **Visualize ROP from here**. This opens the
+   panel at the slot's address, not the gadget pointer stored there.
+3. Click **Analyze**. The simulator consumes the first pointer as an initial
+   return: PC becomes that pointer and SP advances by the target pointer
+   width. Other captured general registers and flags seed the emulator.
+   This does not execute an overflow or redirect the live thread.
+4. Use **Next instruction**, **Prev instruction**, **Next gadget**, **Reset**,
+   or the timeline. Left/Right also move the simulated cursor while this
+   panel is focused. **Sync live views** keeps Disassembly or Memory dump on
+   the selected simulated address without executing the target. Native
+   execution shortcuts are suppressed in the panel.
+
+The graph records execution **occurrences**, not one deduplicated node per
+code address. Reusing a gadget creates another node. Return edges name the
+consumed stack slot; pop/data operands remain data even when their value
+looks like a gadget address. Calls, jumps, and conditional branches split
+occurrences too, but do not invent return slots. A pivot follows the actual
+simulated SP into the new stack segment. This is one concrete path, not a
+graph of every possible branch.
+
+Each instruction row shows the address, SP transition, and short effect chips
+(`Δ` for register writes, `R`/`W` for memory). Long rows are clipped with an
+ellipsis; hover or open the inspector for full text. **Fit** shows the full
+trace; **Selection** centers the selected occurrence; **100%** restores
+readable text size. Drag the background or middle-drag to pan, and use the
+wheel to zoom around the pointer.
+
+The inspector reconstructs state at the cursor:
+
+- **Registers** shows simulated values and the selected instruction's deltas.
+- **Stack** distinguishes observed return targets, data, and unconsumed
+  slots. `*` marks a simulated write. Roles describe use across the trace;
+  they are not guesses based on whether a value points to executable memory.
+- **Memory effects** lists each recorded read/write, with before/after bytes
+  for the selected access. Writes are visible to later simulated
+  instructions, including writes that change a future return target.
+
+No simulation action writes memory/registers, resumes, or single-steps the
+live process. **Sync live views** and explicit **Follow** buttons only
+navigate the live debugger views.
+**Trace recorded** means a trace is available, not that the chain succeeds.
+Read the terminal boundary: system calls and interrupts stop before
+execution, and invalid code, permissions, uncaptured state, or limits stop
+the trace with a diagnostic. Incomplete instructions have no committed
+effects; even a partially executed repeated instruction is rolled back.
+
+Analysis uses the existing Python worker and native-control lease. Defaults
+are 512 stack-preview bytes, 256 instructions, 64 occurrences, and five
+seconds. Expand **Analysis limits** to adjust them; capture size, memory
+effects, and individual instruction execution are also bounded. **Cancel**
+stops analysis without changing the target. A previous trace can remain
+visible while a new request is pending or cancelled.
+
+The panel marks a trace **OFFLINE / STALE** after a detected process, stop,
+thread, register, or tracked-patch change. Offline simulated stepping still
+works, but live Follow actions are disabled. Re-analyze after raw LLDB or
+external memory writes: writes outside the tracked patch API are not all
+detectable by the source fingerprint.
+
+### Execution boundaries
+
+The simulator supports x86-64 and flat-user Linux i386. For i386, missing
+segment bases are accepted only with a Linux target triple and captured
+standard Linux CS/SS selector pairs; the diagnostic names that ABI model.
+Custom/TLS descriptors are not inferred. x86-64 FS/GS accesses require their
+actual captured bases. Missing GPRs, undefined flags used by a later
+instruction, uncaptured SIMD/FPU state, privileged operations, and
+privilege-dependent flag restoration stop explicitly.
+
+Memory is lazily captured from readable live mappings with their reported
+permissions. Unknown bytes are not supplied as zero-filled memory.
+This is a bounded CPU simulation, not an OS, syscall, CET/shadow-stack, or
+exploit-success validator. Other architectures still have the separate
+script-driven angrop workflows below.
+
+Scripts can consume the same read-only trace:
+
+```python
+from mydbg.rop_trace import trace_stack
+
+def run(dbg):
+    trace = trace_stack(dbg, dbg.snapshot().sp, stack_bytes=512,
+                        max_instructions=256, max_nodes=64, timeout=5.0)
+    print(trace["status"], trace["message"])
+    for node in trace["nodes"]:
+        print(node["stack_slot"], hex(node["entry_address"]))
+        for instruction in node["instructions"]:
+            print(instruction["text"], instruction["completed"],
+                  instruction["register_changes"], instruction["memory_accesses"])
+```
+
+`initial_registers` represents the state after the synthetic initial return;
+`stack_slots` retains the original captured bytes as pointer-width values.
+Instruction effects are ordered and reversible. `cancelled=` optionally
+accepts a cancellation callback. This API needs Unicorn and Capstone,
+not an angrop gadget scan.
+
 ## ROP with angrop
 
 `mydbg.rop` wraps angrop's ROP analysis for the ret2win/exploit iteration
@@ -303,7 +412,7 @@ print(landing.summary())                       # rop-landing-landed/MISSED pc=..
 See `examples/rop_crackme.py` for the full loop, including the deliberately
 misaligned chain being rejected with its fault PC.
 
-## Limits and good practice
+## Symbolic execution limits and good practice
 
 - The state snapshot covers the main module mapping, a ±64 KiB stack window,
   and any `extra_regions` you pass. Anything outside is zero-filled

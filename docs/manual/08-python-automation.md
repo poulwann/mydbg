@@ -114,6 +114,11 @@ The signatures below use the actual embedded bindings. Timeout-bearing methods d
 
 Address/register/process/thread integers are unsigned 64-bit bindings; breakpoint IDs/frame indices are unsigned 32-bit. Snapshot/result objects are read-only **copies**, not live LLDB objects. Check their state/revision when ordering matters.
 
+`snapshot.memory_regions` contains read-only mapping records with `start`,
+`end` (exclusive), `readable`, `writable`, `executable`, and `name` fields.
+An empty list means mapping metadata is unavailable, not that an arbitrary
+address is safe to access.
+
 Invalid values commonly raise `ValueError`; conversion errors come from Python/pybind11. Native failures, timeouts, cancellation, generation changes, and invalid state generally raise `RuntimeError`. There is no custom public TimeoutError contract, and diagnostic wording can be translated. Do not parse strings as stable error codes.
 
 Methods release the GIL while waiting on native work. A timeout/cancellation does not retract an already queued command. Reload/restart changes the process generation; waits reject switching silently to a different generation.

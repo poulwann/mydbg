@@ -31,3 +31,10 @@ target_compile_options(debuggee_keygenme PRIVATE
   -g -O0 -fno-stack-protector -fno-omit-frame-pointer -no-pie
 )
 target_link_options(debuggee_keygenme PRIVATE -no-pie)
+
+if(MYDBG_SYMBOLIC_TESTS)
+  add_executable(debuggee_rop_trace
+    ${PROJECT_SOURCE_DIR}/tests/debuggees/rop_trace.c)
+  target_compile_options(debuggee_rop_trace PRIVATE
+    -g -O0 -fno-stack-protector -fno-omit-frame-pointer)
+endif()

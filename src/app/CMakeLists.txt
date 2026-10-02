@@ -25,6 +25,7 @@ add_library(app_ui STATIC
   PythonPanels.cpp
   PythonState.cpp
   PythonSyntax.cpp
+  RopPanel.cpp
   UiSupport.cpp
 )
 target_link_libraries(app_ui

@@ -1,4 +1,4 @@
-# Optional symbolic-execution backend for mydbg (docs/manual/11-symbolic-execution.md).
+# Optional analysis backends for mydbg (docs/manual/11-symbolic-execution.md).
 #
 # Install into the interpreter that LLDB reports with:
 #   lldb --print-script-interpreter-info
@@ -6,7 +6,7 @@
 # cp312-abi3 wheels, so any CPython >= 3.12 works, including 3.13/3.14.
 angr==9.2.223
 angrop==9.2.12.post3
-# Optional concrete-execution fast path (angr.options.unicorn). angr does not
-# declare this dependency, and without it the unicorn engine silently
-# disables itself at import time.
+# Concrete instruction execution and decoding for the ROP stack visualizer.
+# Unicorn also enables angr's optional concrete-execution fast path.
 unicorn==2.1.4
+capstone==5.0.6

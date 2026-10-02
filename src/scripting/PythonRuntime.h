@@ -1,5 +1,7 @@
 #pragma once
 
+#include "scripting/RopTrace.h"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -73,6 +75,9 @@ public:
   [[nodiscard]] bool debug_source(std::string file, std::string source,
                                   std::vector<std::uint32_t> breakpoints = {},
                                   bool stop_on_entry = true);
+  [[nodiscard]] bool trace_rop(RopTraceRequest request);
+  [[nodiscard]] RopTraceSnapshot rop_snapshot() const;
+  void cancel_rop();
   void continue_script();
   void step_into_script();
   void step_over_script();
@@ -87,6 +92,8 @@ public:
   wait_for_completion(std::chrono::milliseconds timeout) const;
 
 private:
+  enum class JobKind { Script, Rop };
+
   enum class StepMode {
     None,
     Into,
@@ -100,13 +107,17 @@ private:
   void resume_script(StepMode mode);
   void run();
   void append_output(std::string text);
-  void finish(ScriptStatus status, std::string traceback);
+  void finish(ScriptStatus status, std::string traceback,
+              std::shared_ptr<const RopTrace> trace = {});
 
   LldbEngine &engine_;
   mutable std::mutex mutex_;
   mutable std::condition_variable changed_;
   std::condition_variable wake_;
   ScriptSnapshot snapshot_;
+  RopTraceSnapshot rop_snapshot_;
+  RopTraceRequest pending_rop_;
+  JobKind job_kind_{JobKind::Script};
   std::string pending_file_;
   std::string pending_source_;
   std::vector<std::uint32_t> pending_breakpoints_;

@@ -1,4 +1,20 @@
 mydbg_add_test(
+  NAME rop_stack_trace
+  COMMAND "${Python_EXECUTABLE}"
+    "${PROJECT_SOURCE_DIR}/tests/symbolic_solver.py"
+    --mydbg $<TARGET_FILE:mydbg>
+    --script "${PROJECT_SOURCE_DIR}/tests/scripts/rop_trace.py"
+    --target "$<TARGET_FILE:debuggee_rop_trace>"
+    --timeout-seconds 90
+    --expect "rop-trace-ok"
+)
+set_tests_properties(rop_stack_trace PROPERTIES
+  TIMEOUT 120
+  SKIP_RETURN_CODE 77
+  PASS_REGULAR_EXPRESSION "symbolic-solver-ok"
+)
+
+mydbg_add_test(
   NAME symbolic_script_x86_64
   COMMAND "${Python_EXECUTABLE}"
     "${PROJECT_SOURCE_DIR}/tests/symbolic_solver.py"

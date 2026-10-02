@@ -7,6 +7,7 @@
 #include "app/MemoryController.h"
 #include "app/MemoryData.h"
 #include "app/MemoryInspection.h"
+#include "app/RopPanel.h"
 #include "app/UiSupport.h"
 #include "backend/lldb/LldbEngine.h"
 #include "localization/Localization.h"
@@ -459,6 +460,12 @@ void draw_memory_panel(const debugger::SessionSnapshot &snapshot,
                           nullptr, false, full_pointer)) {
         ui.memory.selection_anchor = first;
         ui.memory.selection_end = first + pointer_width - 1;
+      }
+      if (ImGui::MenuItem(
+              l10n::label(l10n::Key::GuiRopVisualizeFromHere), nullptr, false,
+              !controls_locked &&
+                  snapshot.state == debugger::SessionState::Stopped)) {
+        open_rop_at(ui, snapshot.memory_base + first);
       }
       const bool pointer_navigable =
           pointer && navigable_address(snapshot, *pointer);

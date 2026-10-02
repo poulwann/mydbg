@@ -31,6 +31,13 @@ void register_python_types(py::module_ &module) {
       .def_readonly("end", &ModuleInfo::end)
       .def_readonly("path", &ModuleInfo::path)
       .def_readonly("uuid", &ModuleInfo::uuid);
+  py::class_<MemoryRegionInfo>(module, "MemoryRegion")
+      .def_readonly("start", &MemoryRegionInfo::start)
+      .def_readonly("end", &MemoryRegionInfo::end)
+      .def_readonly("readable", &MemoryRegionInfo::readable)
+      .def_readonly("writable", &MemoryRegionInfo::writable)
+      .def_readonly("executable", &MemoryRegionInfo::executable)
+      .def_readonly("name", &MemoryRegionInfo::name);
   py::class_<RegisterValue>(module, "RegisterValue")
       .def_readonly("name", &RegisterValue::name)
       .def_readonly("value", &RegisterValue::value);
@@ -105,6 +112,7 @@ void register_python_types(py::module_ &module) {
       .def_readonly("breakpoints", &PythonSnapshot::breakpoints)
       .def_readonly("threads", &PythonSnapshot::threads)
       .def_readonly("modules", &PythonSnapshot::modules)
+      .def_readonly("memory_regions", &PythonSnapshot::memory_regions)
       .def_readonly("patches", &PythonSnapshot::patches)
       .def_property_readonly("output", [](const PythonSnapshot &snapshot) {
         return py::bytes{snapshot.output};

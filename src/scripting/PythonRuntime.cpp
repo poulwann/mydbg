@@ -1,6 +1,7 @@
 #include "scripting/PythonRuntime.h"
 #include "localization/Localization.h"
 #include "scripting/PythonBindings.h"
+#include "scripting/PythonRopTrace.h"
 
 #include <pybind11/embed.h>
 
@@ -245,6 +246,58 @@ bool PythonRuntime::debug_source(std::string file, std::string source,
                     true, stop_on_entry);
 }
 
+bool PythonRuntime::trace_rop(RopTraceRequest request) {
+  {
+    const std::lock_guard lock{mutex_};
+    if (shutting_down_ || has_job_ || snapshot_.control_lease) {
+      return false;
+    }
+    cancellation_ = std::make_shared<std::atomic_bool>(false);
+    pending_rop_ = request;
+    job_kind_ = JobKind::Rop;
+    has_job_ = true;
+    ++snapshot_.job_id;
+    ++snapshot_.revision;
+    snapshot_.status = ScriptStatus::Queued;
+    snapshot_.file.clear();
+    snapshot_.output.clear();
+    snapshot_.traceback.clear();
+    snapshot_.control_lease = true;
+    snapshot_.debug_state = ScriptDebugState::Inactive;
+    snapshot_.current_line = 0;
+    snapshot_.frames.clear();
+    snapshot_.globals.clear();
+    rop_snapshot_ = RopTraceSnapshot{.job_id = snapshot_.job_id,
+                                     .status = RopJobStatus::Queued,
+                                     .trace = {},
+                                     .error = {}};
+  }
+  changed_.notify_all();
+  wake_.notify_one();
+  return true;
+}
+
+RopTraceSnapshot PythonRuntime::rop_snapshot() const {
+  const std::lock_guard lock{mutex_};
+  return rop_snapshot_;
+}
+
+void PythonRuntime::cancel_rop() {
+  {
+    const std::lock_guard lock{mutex_};
+    if (job_kind_ != JobKind::Rop || !snapshot_.control_lease ||
+        !cancellation_) {
+      return;
+    }
+    cancellation_->store(true);
+    rop_snapshot_.status = RopJobStatus::Cancelling;
+    snapshot_.status = ScriptStatus::Cancelling;
+    ++snapshot_.revision;
+  }
+  changed_.notify_all();
+  wake_.notify_all();
+}
+
 bool PythonRuntime::submit_job(std::string file, std::string source,
                                std::vector<std::uint32_t> breakpoints,
                                bool debug, bool stop_on_entry) {
@@ -260,6 +313,7 @@ bool PythonRuntime::submit_job(std::string file, std::string source,
       return false;
     }
     cancellation_ = std::make_shared<std::atomic_bool>(false);
+    job_kind_ = JobKind::Script;
     pending_file_ = std::move(file);
     pending_debug_ = debug;
     if (debug) {
@@ -330,7 +384,7 @@ void PythonRuntime::set_breakpoints(std::vector<std::uint32_t> breakpoints) {
   {
     const std::lock_guard lock{mutex_};
     snapshot_.breakpoints = breakpoints;
-    if (has_job_) {
+    if (has_job_ && job_kind_ == JobKind::Script) {
       pending_breakpoints_ = std::move(breakpoints);
     }
     ++snapshot_.revision;
@@ -346,6 +400,9 @@ void PythonRuntime::stop() {
     }
     cancellation_->store(true);
     snapshot_.status = ScriptStatus::Cancelling;
+    if (job_kind_ == JobKind::Rop) {
+      rop_snapshot_.status = RopJobStatus::Cancelling;
+    }
     ++snapshot_.revision;
   }
   changed_.notify_all();
@@ -360,8 +417,13 @@ void PythonRuntime::shutdown() {
       return;
     }
     shutting_down_ = true;
-    if (cancellation_) {
+    if (snapshot_.control_lease && cancellation_) {
       cancellation_->store(true);
+      snapshot_.status = ScriptStatus::Cancelling;
+      if (job_kind_ == JobKind::Rop) {
+        rop_snapshot_.status = RopJobStatus::Cancelling;
+      }
+      ++snapshot_.revision;
     }
   }
   wake_.notify_all();
@@ -406,9 +468,26 @@ void PythonRuntime::append_output(std::string text) {
   changed_.notify_all();
 }
 
-void PythonRuntime::finish(ScriptStatus status, std::string traceback) {
+void PythonRuntime::finish(ScriptStatus status, std::string traceback,
+                           std::shared_ptr<const RopTrace> trace) {
   {
     const std::lock_guard lock{mutex_};
+    if (job_kind_ == JobKind::Rop) {
+      // Resolve cancellation while still holding the job's control lease:
+      // neither a late cancel nor a subsequent script can change its token.
+      if (cancellation_->load() || (trace && trace->status == "cancelled")) {
+        status = ScriptStatus::Cancelled;
+        if (traceback.empty()) {
+          traceback = l10n::text(l10n::Key::RopRuntimeCancelled);
+        }
+      }
+      rop_snapshot_.status =
+          status == ScriptStatus::Cancelled ? RopJobStatus::Cancelled
+          : status == ScriptStatus::Failed  ? RopJobStatus::Failed
+                                            : RopJobStatus::Succeeded;
+      rop_snapshot_.trace = std::move(trace);
+      rop_snapshot_.error = bounded_traceback(traceback);
+    }
     snapshot_.status = status;
     snapshot_.traceback = bounded_traceback(std::move(traceback));
     snapshot_.control_lease = false;
@@ -416,6 +495,7 @@ void PythonRuntime::finish(ScriptStatus status, std::string traceback) {
     snapshot_.current_line = 0;
     step_mode_ = StepMode::None;
     step_frame_depth_ = 0;
+    cancellation_.reset();
     ++snapshot_.revision;
   }
   changed_.notify_all();
@@ -427,6 +507,8 @@ void PythonRuntime::run() {
     std::shared_ptr<std::atomic_bool> cancellation;
     std::string source;
     bool debug{};
+    JobKind kind{};
+    RopTraceRequest rop_request;
     {
       std::unique_lock lock{mutex_};
       wake_.wait(lock, [this] { return has_job_ || shutting_down_; });
@@ -437,23 +519,47 @@ void PythonRuntime::run() {
         changed_.notify_all();
         return;
       }
-      file = std::move(pending_file_);
+      kind = job_kind_;
+      rop_request = pending_rop_;
       cancellation = cancellation_;
-      source = std::move(pending_source_);
-      debug = pending_debug_;
-      pending_debug_ = false;
+      if (kind == JobKind::Script) {
+        file = std::move(pending_file_);
+        source = std::move(pending_source_);
+        debug = pending_debug_;
+        pending_debug_ = false;
+        snapshot_.breakpoints = std::move(pending_breakpoints_);
+      }
       has_job_ = false;
       snapshot_.status = cancellation->load() ? ScriptStatus::Cancelling
                                               : ScriptStatus::Running;
       snapshot_.debug_state =
           debug ? ScriptDebugState::Running : ScriptDebugState::Inactive;
-      snapshot_.breakpoints = std::move(pending_breakpoints_);
+      if (kind == JobKind::Rop) {
+        rop_snapshot_.status = cancellation->load() ? RopJobStatus::Cancelling
+                                                    : RopJobStatus::Running;
+      }
       ++snapshot_.revision;
     }
     changed_.notify_all();
 
     ScriptStatus result = ScriptStatus::Succeeded;
     std::string traceback;
+    if (kind == JobKind::Rop) {
+      std::shared_ptr<const RopTrace> trace;
+      try {
+        if (cancellation->load()) {
+          result = ScriptStatus::Cancelled;
+        } else {
+          trace = run_rop_trace(engine_, rop_request, cancellation);
+        }
+      } catch (const std::exception &error) {
+        traceback = error.what();
+        result = cancellation->load() ? ScriptStatus::Cancelled
+                                      : ScriptStatus::Failed;
+      }
+      finish(result, std::move(traceback), std::move(trace));
+      continue;
+    }
     try {
       py::gil_scoped_acquire acquire;
       py::module_ sys = py::module_::import("sys");

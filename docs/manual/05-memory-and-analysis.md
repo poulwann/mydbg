@@ -45,6 +45,11 @@ The selection menu interprets a pointer starting at the **first selected byte**,
 
 A null, unmapped, truncated, or otherwise unavailable destination may disable navigation. It is not made valid by changing the clipboard word size. Right-click a row address for row-level breakpoint/conditional actions, **Use dump address**, and **Show memory map**; that is a different menu from the selected-byte export menu.
 
+**Visualize ROP from here** uses the first selected byte's **address** as a
+proposed stack, without dereferencing it for navigation. It opens the
+[ROP visualizer](11-symbolic-execution.md#stack-driven-rop-visualizer);
+click **Analyze** there to record a read-only, steppable simulation.
+
 ### Editing bytes
 
 Enable **Edit**, choose the context-menu edit action, or double-click a hex byte. Enter two hex digits in the cell. Enter or leaving an edited cell commits a changed valid byte through the tracked patch path. Invalid input reports an error; Escape or clicking outside the memory table exits edit mode.
@@ -149,6 +154,10 @@ The UI displays only the first 10,000 candidates, while refinement still conside
 **View > Stack telescope** shows up to 32 target-width slots from the current SP. Each row has the slot address, stored value, and available symbol/pointer-chain annotation.
 
 Click the **slot address** to inspect the stack slot itself. Right-click the **value** to navigate the pointed-to address, find its mapping, or add a breakpoint. These addresses are not interchangeable.
+
+Right-click a **slot address** and choose **Visualize ROP from here** to use
+that slot as the first return pointer in the
+[ROP visualizer](11-symbolic-execution.md#stack-driven-rop-visualizer).
 
 Captured pointer chains follow at most three dereferences and stop on null, cycles, unmapped/unreadable data, or errors. The console `telescope`, `p2p`, and `plist` commands offer separate bounded read-only traversals. They do not prove an arbitrary pointer is a valid object or linked-list node.
 

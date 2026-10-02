@@ -8,6 +8,7 @@
 #include "app/DisassemblyGraph.h"
 #include "app/DisassemblyText.h"
 #include "app/DisassemblyTextDrawing.h"
+#include "app/RopPanel.h"
 #include "app/UiSupport.h"
 #include "localization/Localization.h"
 #include <imgui_internal.h>
@@ -781,6 +782,12 @@ void draw_stack_panel(const debugger::SessionSnapshot &snapshot,
       std::snprintf(address, sizeof(address), "0x%" PRIx64, entry.address);
       if (ImGui::Selectable(address, false)) {
         follow_memory(engine, ui.memory, entry.address);
+      }
+      if (ImGui::BeginPopupContextItem("stack-address-context")) {
+        if (ImGui::MenuItem(l10n::label(l10n::Key::GuiRopVisualizeFromHere))) {
+          open_rop_at(ui, entry.address);
+        }
+        ImGui::EndPopup();
       }
       ImGui::TableSetColumnIndex(1);
       ImGui::Text("0x%" PRIx64, entry.value);

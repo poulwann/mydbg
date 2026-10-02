@@ -29,7 +29,8 @@ struct PythonSnapshot {
         exit_status(snapshot.exit_status), registers(snapshot.registers),
         instructions(snapshot.instructions), breakpoints(snapshot.breakpoints),
         threads(snapshot.threads), modules(snapshot.modules),
-        patches(snapshot.patches), output(snapshot.process_output) {}
+        memory_regions(snapshot.memory_regions), patches(snapshot.patches),
+        output(snapshot.process_output) {}
 
   std::string state;
   std::string mode;
@@ -55,6 +56,7 @@ struct PythonSnapshot {
   std::vector<BreakpointInfo> breakpoints;
   std::vector<ThreadInfo> threads;
   std::vector<ModuleInfo> modules;
+  std::vector<MemoryRegionInfo> memory_regions;
   std::vector<PatchInfo> patches;
   std::string output;
 };

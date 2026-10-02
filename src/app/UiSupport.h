@@ -29,7 +29,7 @@ struct UiPanelSetting {
   bool WorkspaceState::*visible;
 };
 
-extern const std::array<UiPanelSetting, 8> ui_panel_settings;
+extern const std::array<UiPanelSetting, 9> ui_panel_settings;
 
 float configured_ui_scale(float fallback);
 float window_display_scale(SDL_Window *window);
